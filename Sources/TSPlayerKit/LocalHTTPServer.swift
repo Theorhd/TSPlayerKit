@@ -12,7 +12,7 @@ final class LocalHTTPServer: @unchecked Sendable {
 
     /// Segment metadata for multi-segment mode. When non-nil, `/segment_N.ts` URLs
     /// are routed to the corresponding byte range. When nil, the server operates in
-    /// legacy single-segment mode (`/segment.ts` with the 8 MB response cap).
+    /// legacy single-segment mode (`/segment.ts` served via chunked transfer encoding).
     private let segments: [SegmentInfo]?
 
     private let serverQueue = DispatchQueue(
@@ -133,13 +133,13 @@ final class LocalHTTPServer: @unchecked Sendable {
             let rawHeaders = String(data: headers, encoding: .utf8),
             let requestLine = rawHeaders.components(separatedBy: "\r\n").first
         else {
-            sendResponse(statusCode: 400, headers: [:], body: Data(), on: connection)
+            sendError(statusCode: 400, on: connection)
             return
         }
 
         let parts = requestLine.components(separatedBy: " ")
         guard parts.count >= 2 else {
-            sendResponse(statusCode: 400, headers: [:], body: Data(), on: connection)
+            sendError(statusCode: 400, on: connection)
             return
         }
 
@@ -157,10 +157,12 @@ final class LocalHTTPServer: @unchecked Sendable {
                 let rangeHeader = extractHeader("Range", from: rawHeaders)
                 serveSegment(index: index, rangeHeader: rangeHeader, on: connection)
             } else {
-                sendResponse(statusCode: 404, headers: [:], body: Data(), on: connection)
+                sendError(statusCode: 404, on: connection)
             }
         }
     }
+
+    // MARK: - Manifest
 
     private func serveManifest(on connection: NWConnection) {
         manifestLock.lock()
@@ -180,12 +182,10 @@ final class LocalHTTPServer: @unchecked Sendable {
         )
     }
 
-    // MARK: - Segment serving
+    // MARK: - Segment index parsing
 
     /// Parses a segment index from a path like `/segment_42.ts`.
-    /// Returns nil if the path doesn't match the expected pattern.
     private func parseSegmentIndex(from path: String) -> Int? {
-        // Pattern: "/segment_" + digits + ".ts"
         guard path.hasPrefix("/segment_"), path.hasSuffix(".ts") else { return nil }
         let start = path.index(path.startIndex, offsetBy: "/segment_".count)
         let end = path.index(path.endIndex, offsetBy: -".ts".count)
@@ -193,21 +193,20 @@ final class LocalHTTPServer: @unchecked Sendable {
         return Int(path[start..<end])
     }
 
+    // MARK: - Multi-segment serving (no cap, complete segments)
+
     /// Multi-segment mode: serves the exact byte range for segment `index`.
     ///
-    /// Individual HLS segments are small (typically 2–10 s, < 10 MB), so the
-    /// full byte range is read into memory and served in one response — no 8 MB
-    /// cap needed. This is what fixes the ~6-second truncation bug: with a
-    /// single-segment manifest the cap prevented AVPlayer from receiving more
-    /// than a few seconds of video, but with a multi-segment manifest each
-    /// segment fits comfortably within memory limits.
+    /// Individual HLS segments are small (typically 2–10 s, < 10 MB), so the full
+    /// byte range is read into memory and served as 200 OK — no 8 MB cap, no 206
+    /// Partial Content. AVPlayer sees a normal complete HLS segment.
     private func serveSegment(
         index: Int,
         rangeHeader: String?,
         on connection: NWConnection
     ) {
         guard let segments, index >= 0, index < segments.count else {
-            sendResponse(statusCode: 404, headers: [:], body: Data(), on: connection)
+            sendError(statusCode: 404, on: connection)
             return
         }
 
@@ -215,11 +214,13 @@ final class LocalHTTPServer: @unchecked Sendable {
         let segmentStart = segment.offset
         let segmentEnd = segment.offset + segment.length - 1
 
-        // If the client sends a Range header, honour it within the segment bounds.
+        // If the client sends a Range header (seeking within a segment), honour it.
         var start: UInt64 = segmentStart
         var end: UInt64 = segmentEnd
+        var isRangeRequest = false
 
         if let range = rangeHeader, range.lowercased().hasPrefix("bytes=") {
+            isRangeRequest = true
             let rangeSpec = String(range.dropFirst("bytes=".count))
             let bounds = rangeSpec.components(separatedBy: "-")
             if let s = bounds.first, !s.isEmpty, let sv = UInt64(s) {
@@ -238,47 +239,57 @@ final class LocalHTTPServer: @unchecked Sendable {
             do {
                 let data = try await streamer.readBytes(offset: start, length: requestedLength)
 
-                let responseHeaders: [String: String] = [
-                    "Content-Type": "video/mp2t",
-                    "Content-Length": "\(data.count)",
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "no-cache",
-                    "Content-Range": "bytes \(start)-\(end)/\(streamer.fileSize)",
-                ]
-                self.sendResponse(
-                    statusCode: 206,
-                    headers: responseHeaders,
-                    body: data,
-                    on: connection
-                )
+                if isRangeRequest {
+                    // Seeking within a segment — return 206 with Content-Range.
+                    let responseHeaders: [String: String] = [
+                        "Content-Type": "video/mp2t",
+                        "Content-Length": "\(data.count)",
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-cache",
+                        "Content-Range": "bytes \(start)-\(end)/\(streamer.fileSize)",
+                    ]
+                    self.sendResponse(statusCode: 206, headers: responseHeaders, body: data, on: connection)
+                } else {
+                    // Complete segment — return 200 OK, no Content-Range needed.
+                    let responseHeaders: [String: String] = [
+                        "Content-Type": "video/mp2t",
+                        "Content-Length": "\(data.count)",
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-cache",
+                    ]
+                    self.sendResponse(statusCode: 200, headers: responseHeaders, body: data, on: connection)
+                }
             } catch {
-                self.sendResponse(
-                    statusCode: 500,
-                    headers: [:],
-                    body: Data(),
-                    on: connection
-                )
+                self.sendError(statusCode: 500, on: connection)
             }
         }
     }
 
-    /// Legacy single-segment mode: serves the entire TS file as one segment.
+    // MARK: - Legacy single-segment serving (chunked transfer, no cap)
+
+    /// Serves the entire TS file as one segment using **chunked transfer encoding**.
     ///
-    /// Responses are capped at `maxChunkSize` (8 MB) to avoid reading a multi-GB
-    /// file into memory. This cap is the root cause of the ~6-second playback bug
-    /// (8 MB / ~10 Mbps ≈ 6.4 s). New downloads use the multi-segment mode above;
-    /// this path remains for backward compatibility with downloads that don't have
-    /// a `video.segments.json` sidecar.
+    /// The old implementation capped responses at 8 MB to avoid reading multi-GB
+    /// files into memory. This caused the ~6-second playback bug because AVPlayer
+    /// treats a truncated HLS segment as complete and stops.
+    ///
+    /// The fix: use `Transfer-Encoding: chunked` to stream the file in 1 MB chunks
+    /// over a single HTTP response. AVPlayer receives the full segment data without
+    /// the server ever holding more than 1 MB in memory at once.
+    ///
+    /// If the client sends a Range header (seeking), the response is capped to the
+    /// requested range — no chunked encoding needed for small seek probes.
     private func serveLegacySegment(rangeHeader: String?, on connection: NWConnection) {
         let fileSize = streamer.fileSize
 
         guard fileSize > 0 else {
-            sendResponse(statusCode: 500, headers: [:], body: Data(), on: connection)
+            sendError(statusCode: 500, on: connection)
             return
         }
 
         var start: UInt64 = 0
         var end: UInt64 = fileSize - 1
+        let isRangeRequest = (rangeHeader != nil)
 
         if let range = rangeHeader, range.lowercased().hasPrefix("bytes=") {
             let rangeSpec = String(range.dropFirst("bytes=".count))
@@ -290,43 +301,132 @@ final class LocalHTTPServer: @unchecked Sendable {
             end = min(end, fileSize - 1)
         }
 
-        // Cap each response to 8 MB. If the caller requested a smaller range (e.g. for
-        // a seek probe) we honour that exact range. If the requested range is larger we
-        // serve only the first maxChunkSize bytes and report the real file size in
-        // Content-Range so AVPlayer knows there is more data to fetch.
-        let maxChunkSize: UInt64 = 8 * 1024 * 1024 // 8 MB
         let requestedLength = end - start + 1
-        let servedLength = min(requestedLength, maxChunkSize)
-        let actualEnd = start + servedLength - 1
 
-        Task { [streamer] in
-            do {
-                let data = try await streamer.readBytes(offset: start, length: servedLength)
-                // Always respond 206 so AVPlayer sees Content-Range and knows the total
-                // file size, enabling it to make follow-up requests for remaining bytes.
-                let responseHeaders: [String: String] = [
-                    "Content-Type": "video/mp2t",
-                    "Content-Length": "\(data.count)",
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "no-cache",
-                    "Content-Range": "bytes \(start)-\(actualEnd)/\(fileSize)",
-                ]
-                self.sendResponse(
-                    statusCode: 206,
-                    headers: responseHeaders,
-                    body: data,
-                    on: connection
-                )
-            } catch {
-                self.sendResponse(
-                    statusCode: 500,
-                    headers: [:],
-                    body: Data(),
-                    on: connection
-                )
+        // For small Range requests (seek probes, typically a few KB), serve directly.
+        // For full-segment requests (no Range header) or large ranges, use chunked
+        // transfer encoding to stream without blowing memory.
+        let maxDirectServe: UInt64 = 16 * 1024 * 1024 // 16 MB
+        if isRangeRequest && requestedLength <= maxDirectServe {
+            Task { [streamer] in
+                do {
+                    let data = try await streamer.readBytes(offset: start, length: requestedLength)
+                    let responseHeaders: [String: String] = [
+                        "Content-Type": "video/mp2t",
+                        "Content-Length": "\(data.count)",
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-cache",
+                        "Content-Range": "bytes \(start)-\(end)/\(fileSize)",
+                    ]
+                    self.sendResponse(statusCode: 206, headers: responseHeaders, body: data, on: connection)
+                } catch {
+                    self.sendError(statusCode: 500, on: connection)
+                }
             }
+        } else {
+            // Full segment or large range — stream using chunked transfer encoding.
+            streamFileChunked(
+                startOffset: start,
+                totalLength: requestedLength,
+                on: connection
+            )
         }
     }
+
+    /// Streams a byte range of the TS file to the client using HTTP chunked transfer
+    /// encoding. Each chunk is at most 1 MB to keep memory usage low. The method
+    /// sends chunks sequentially via NWConnection, chaining completions.
+    ///
+    /// HTTP chunked format:
+    ///   <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
+    private func streamFileChunked(
+        startOffset: UInt64,
+        totalLength: UInt64,
+        on connection: NWConnection
+    ) {
+        let chunkSizeLimit: UInt64 = 1024 * 1024 // 1 MB per chunk
+
+        // Send HTTP response head with Transfer-Encoding: chunked.
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        guard let headData = head.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+
+        connection.send(content: headData, completion: .contentProcessed { [weak self] error in
+            if let error {
+                NSLog("[TSPlayerKit] Head send error: \(error)")
+                connection.cancel()
+                return
+            }
+            self?.sendNextChunk(
+                offset: startOffset,
+                remaining: totalLength,
+                chunkLimit: chunkSizeLimit,
+                on: connection
+            )
+        })
+    }
+
+    /// Recursively sends one chunk then schedules the next.
+    private func sendNextChunk(
+        offset: UInt64,
+        remaining: UInt64,
+        chunkLimit: UInt64,
+        on connection: NWConnection
+    ) {
+        guard remaining > 0 else {
+            // All data sent — write the terminating chunk.
+            let terminator = Data("0\r\n\r\n".utf8)
+            connection.send(content: terminator, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+            return
+        }
+
+        let readLen = min(remaining, chunkLimit)
+
+        Task { [streamer] in
+            let chunk: Data
+            do {
+                chunk = try await streamer.readBytes(offset: offset, length: readLen)
+            } catch {
+                NSLog("[TSPlayerKit] Chunk read error: \(error)")
+                connection.cancel()
+                return
+            }
+
+            // Format: <hex-size>\r\n<data>\r\n
+            let hexSize = String(format: "%X\r\n", chunk.count)
+            guard let hexData = hexSize.data(using: .utf8) else {
+                connection.cancel()
+                return
+            }
+
+            var chunkMessage = Data()
+            chunkMessage.append(hexData)
+            chunkMessage.append(chunk)
+            chunkMessage.append(Data("\r\n".utf8))
+
+            connection.send(content: chunkMessage, completion: .contentProcessed { [weak self] error in
+                if let error {
+                    NSLog("[TSPlayerKit] Chunk send error: \(error)")
+                    connection.cancel()
+                    return
+                }
+                let newOffset = offset + UInt64(chunk.count)
+                let newRemaining = remaining - UInt64(chunk.count)
+                self?.sendNextChunk(
+                    offset: newOffset,
+                    remaining: newRemaining,
+                    chunkLimit: chunkLimit,
+                    on: connection
+                )
+            })
+        }
+    }
+
+    // MARK: - HTTP response helpers
 
     private func sendResponse(
         statusCode: Int,
@@ -359,6 +459,10 @@ final class LocalHTTPServer: @unchecked Sendable {
                 connection.cancel()
             }
         )
+    }
+
+    private func sendError(statusCode: Int, on connection: NWConnection) {
+        sendResponse(statusCode: statusCode, headers: [:], body: Data(), on: connection)
     }
 
     private func extractHeader(_ name: String, from rawHeaders: String) -> String? {
