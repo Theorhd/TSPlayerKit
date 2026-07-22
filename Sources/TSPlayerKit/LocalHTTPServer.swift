@@ -159,6 +159,12 @@ final class LocalHTTPServer: @unchecked Sendable {
     }
 
     // Parses HTTP Range headers ("bytes=start-end") for AVPlayer seeking and returns 206 Partial Content.
+    // ⚠️ CRITICAL: Responses are capped at maxChunkSize bytes.
+    // For a 1-hour TS file at 4 Mbps the full file is ~1.8 GB. Trying to read that into a
+    // single Data object on iOS causes a silent partial read (only a few MB are returned),
+    // which means AVPlayer receives only a few seconds of video before the connection closes
+    // and playback stops. AVFoundation handles 206 Partial Content + Content-Range
+    // transparently: it will issue follow-up range requests for the remaining bytes.
     private func serveSegment(rangeHeader: String?, on connection: NWConnection) {
         let fileSize = streamer.fileSize
 
@@ -169,10 +175,8 @@ final class LocalHTTPServer: @unchecked Sendable {
 
         var start: UInt64 = 0
         var end: UInt64 = fileSize - 1
-        var isRangeRequest = false
 
         if let range = rangeHeader, range.lowercased().hasPrefix("bytes=") {
-            isRangeRequest = true
             let rangeSpec = String(range.dropFirst("bytes=".count))
             let bounds = rangeSpec.components(separatedBy: "-")
             if let s = bounds.first, !s.isEmpty, let sv = UInt64(s) { start = sv }
@@ -182,24 +186,29 @@ final class LocalHTTPServer: @unchecked Sendable {
             end = min(end, fileSize - 1)
         }
 
-        let length = end - start + 1
+        // Cap each response to 8 MB. If the caller requested a smaller range (e.g. for
+        // a seek probe) we honour that exact range. If the requested range is larger we
+        // serve only the first maxChunkSize bytes and report the real file size in
+        // Content-Range so AVPlayer knows there is more data to fetch.
+        let maxChunkSize: UInt64 = 8 * 1024 * 1024 // 8 MB
+        let requestedLength = end - start + 1
+        let servedLength = min(requestedLength, maxChunkSize)
+        let actualEnd = start + servedLength - 1
 
         Task { [streamer] in
             do {
-                let data = try await streamer.readBytes(offset: start, length: length)
-                let statusCode = isRangeRequest ? 206 : 200
-                var responseHeaders: [String: String] = [
+                let data = try await streamer.readBytes(offset: start, length: servedLength)
+                // Always respond 206 so AVPlayer sees Content-Range and knows the total
+                // file size, enabling it to make follow-up requests for remaining bytes.
+                let responseHeaders: [String: String] = [
                     "Content-Type": "video/mp2t",
                     "Content-Length": "\(data.count)",
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-cache",
+                    "Content-Range": "bytes \(start)-\(actualEnd)/\(fileSize)",
                 ]
-                if isRangeRequest {
-                    responseHeaders["Content-Range"] =
-                        "bytes \(start)-\(end)/\(fileSize)"
-                }
                 self.sendResponse(
-                    statusCode: statusCode,
+                    statusCode: 206,
                     headers: responseHeaders,
                     body: data,
                     on: connection
