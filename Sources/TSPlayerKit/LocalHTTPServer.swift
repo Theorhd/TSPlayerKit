@@ -10,6 +10,11 @@ final class LocalHTTPServer: @unchecked Sendable {
     private let streamer: FileStreamer
     private var listener: NWListener?
 
+    /// Segment metadata for multi-segment mode. When non-nil, `/segment_N.ts` URLs
+    /// are routed to the corresponding byte range. When nil, the server operates in
+    /// legacy single-segment mode (`/segment.ts` with the 8 MB response cap).
+    private let segments: [SegmentInfo]?
+
     private let serverQueue = DispatchQueue(
         label: "com.tsplayerkit.localserver",
         qos: .userInitiated
@@ -18,8 +23,19 @@ final class LocalHTTPServer: @unchecked Sendable {
     // Blocks init until NWListener is ready and port is assigned.
     private let readySemaphore = DispatchSemaphore(value: 0)
 
+    /// Legacy single-segment mode.
     init(streamer: FileStreamer) throws {
         self.streamer = streamer
+        self.segments = nil
+        try start()
+    }
+
+    /// Multi-segment mode — each segment is served by its exact byte range without
+    /// any response-size cap, fixing the ~6-second truncation that occurred when a
+    /// single-segment manifest was capped at 8 MB.
+    init(streamer: FileStreamer, segments: [SegmentInfo]) throws {
+        self.streamer = streamer
+        self.segments = segments
         try start()
     }
 
@@ -134,9 +150,15 @@ final class LocalHTTPServer: @unchecked Sendable {
             serveManifest(on: connection)
         case "/segment.ts":
             let rangeHeader = extractHeader("Range", from: rawHeaders)
-            serveSegment(rangeHeader: rangeHeader, on: connection)
+            serveLegacySegment(rangeHeader: rangeHeader, on: connection)
         default:
-            sendResponse(statusCode: 404, headers: [:], body: Data(), on: connection)
+            // Multi-segment routing: /segment_<index>.ts
+            if let index = parseSegmentIndex(from: path) {
+                let rangeHeader = extractHeader("Range", from: rawHeaders)
+                serveSegment(index: index, rangeHeader: rangeHeader, on: connection)
+            } else {
+                sendResponse(statusCode: 404, headers: [:], body: Data(), on: connection)
+            }
         }
     }
 
@@ -158,14 +180,96 @@ final class LocalHTTPServer: @unchecked Sendable {
         )
     }
 
-    // Parses HTTP Range headers ("bytes=start-end") for AVPlayer seeking and returns 206 Partial Content.
-    // ⚠️ CRITICAL: Responses are capped at maxChunkSize bytes.
-    // For a 1-hour TS file at 4 Mbps the full file is ~1.8 GB. Trying to read that into a
-    // single Data object on iOS causes a silent partial read (only a few MB are returned),
-    // which means AVPlayer receives only a few seconds of video before the connection closes
-    // and playback stops. AVFoundation handles 206 Partial Content + Content-Range
-    // transparently: it will issue follow-up range requests for the remaining bytes.
-    private func serveSegment(rangeHeader: String?, on connection: NWConnection) {
+    // MARK: - Segment serving
+
+    /// Parses a segment index from a path like `/segment_42.ts`.
+    /// Returns nil if the path doesn't match the expected pattern.
+    private func parseSegmentIndex(from path: String) -> Int? {
+        // Pattern: "/segment_" + digits + ".ts"
+        guard path.hasPrefix("/segment_"), path.hasSuffix(".ts") else { return nil }
+        let start = path.index(path.startIndex, offsetBy: "/segment_".count)
+        let end = path.index(path.endIndex, offsetBy: -".ts".count)
+        guard start < end else { return nil }
+        return Int(path[start..<end])
+    }
+
+    /// Multi-segment mode: serves the exact byte range for segment `index`.
+    ///
+    /// Individual HLS segments are small (typically 2–10 s, < 10 MB), so the
+    /// full byte range is read into memory and served in one response — no 8 MB
+    /// cap needed. This is what fixes the ~6-second truncation bug: with a
+    /// single-segment manifest the cap prevented AVPlayer from receiving more
+    /// than a few seconds of video, but with a multi-segment manifest each
+    /// segment fits comfortably within memory limits.
+    private func serveSegment(
+        index: Int,
+        rangeHeader: String?,
+        on connection: NWConnection
+    ) {
+        guard let segments, index >= 0, index < segments.count else {
+            sendResponse(statusCode: 404, headers: [:], body: Data(), on: connection)
+            return
+        }
+
+        let segment = segments[index]
+        let segmentStart = segment.offset
+        let segmentEnd = segment.offset + segment.length - 1
+
+        // If the client sends a Range header, honour it within the segment bounds.
+        var start: UInt64 = segmentStart
+        var end: UInt64 = segmentEnd
+
+        if let range = rangeHeader, range.lowercased().hasPrefix("bytes=") {
+            let rangeSpec = String(range.dropFirst("bytes=".count))
+            let bounds = rangeSpec.components(separatedBy: "-")
+            if let s = bounds.first, !s.isEmpty, let sv = UInt64(s) {
+                start = segmentStart + sv
+            }
+            if bounds.count > 1, let e = bounds.last, !e.isEmpty, let ev = UInt64(e) {
+                end = min(segmentStart + ev, segmentEnd)
+            }
+            end = min(end, segmentEnd)
+            start = max(start, segmentStart)
+        }
+
+        let requestedLength = end - start + 1
+
+        Task { [streamer] in
+            do {
+                let data = try await streamer.readBytes(offset: start, length: requestedLength)
+
+                let responseHeaders: [String: String] = [
+                    "Content-Type": "video/mp2t",
+                    "Content-Length": "\(data.count)",
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-cache",
+                    "Content-Range": "bytes \(start)-\(end)/\(streamer.fileSize)",
+                ]
+                self.sendResponse(
+                    statusCode: 206,
+                    headers: responseHeaders,
+                    body: data,
+                    on: connection
+                )
+            } catch {
+                self.sendResponse(
+                    statusCode: 500,
+                    headers: [:],
+                    body: Data(),
+                    on: connection
+                )
+            }
+        }
+    }
+
+    /// Legacy single-segment mode: serves the entire TS file as one segment.
+    ///
+    /// Responses are capped at `maxChunkSize` (8 MB) to avoid reading a multi-GB
+    /// file into memory. This cap is the root cause of the ~6-second playback bug
+    /// (8 MB / ~10 Mbps ≈ 6.4 s). New downloads use the multi-segment mode above;
+    /// this path remains for backward compatibility with downloads that don't have
+    /// a `video.segments.json` sidecar.
+    private func serveLegacySegment(rangeHeader: String?, on connection: NWConnection) {
         let fileSize = streamer.fileSize
 
         guard fileSize > 0 else {
