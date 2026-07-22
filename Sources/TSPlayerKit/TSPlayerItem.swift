@@ -62,6 +62,25 @@ public final class TSPlayerItem {
         self.playerItem = AVPlayerItem(asset: asset)
     }
 
+    /// Creates a configured `AVPlayerItem` for fMP4 (fragmented MP4 / CMAF)
+    /// content stored as a local HLS playlist + segment files.
+    ///
+    /// The directory must contain an `index.m3u8` playlist and all referenced
+    /// segment files (init segments + `.m4s` chunks). A local HTTP server serves
+    /// the directory, and AVPlayer loads the playlist over HTTP — no file://
+    /// HLS support required.
+    ///
+    /// - Parameter fmp4Directory: Directory containing `index.m3u8` and all
+    ///   segment files referenced by it.
+    public init(fmp4Directory: URL) throws {
+        let server = try LocalHTTPServer(directoryURL: fmp4Directory)
+        self.httpServer = server
+
+        let manifestURL = HLSManifestGenerator.manifestURL(port: server.port)
+        let asset = AVURLAsset(url: manifestURL)
+        self.playerItem = AVPlayerItem(asset: asset)
+    }
+
     /// Creates a configured `AVPlayerItem` for a local `.ts` file using a
     /// **single-segment** HLS manifest (legacy fallback).
     ///

@@ -7,13 +7,19 @@ final class LocalHTTPServer: @unchecked Sendable {
     private(set) var port: UInt16 = 0
     private var manifestData: Data = Data()
     private let manifestLock = NSLock()
-    private let streamer: FileStreamer
+    private let streamer: FileStreamer?
     private var listener: NWListener?
 
     /// Segment metadata for multi-segment mode. When non-nil, `/segment_N.ts` URLs
     /// are routed to the corresponding byte range. When nil, the server operates in
     /// legacy single-segment mode (`/segment.ts` served via chunked transfer encoding).
     private let segments: [SegmentInfo]?
+
+    /// When non-nil, the server operates in **static file directory** mode (fMP4).
+    /// URL paths are mapped directly to files in this directory:
+    ///   /playlist.m3u8 → directory/index.m3u8
+    ///   /chunk_0.m4s  → directory/chunk_0.m4s
+    private let directoryURL: URL?
 
     private let serverQueue = DispatchQueue(
         label: "com.tsplayerkit.localserver",
@@ -23,19 +29,29 @@ final class LocalHTTPServer: @unchecked Sendable {
     // Blocks init until NWListener is ready and port is assigned.
     private let readySemaphore = DispatchSemaphore(value: 0)
 
-    /// Legacy single-segment mode.
+    /// Legacy single-segment TS mode (chunked transfer via FileStreamer).
     init(streamer: FileStreamer) throws {
         self.streamer = streamer
         self.segments = nil
+        self.directoryURL = nil
         try start()
     }
 
-    /// Multi-segment mode — each segment is served by its exact byte range without
-    /// any response-size cap, fixing the ~6-second truncation that occurred when a
-    /// single-segment manifest was capped at 8 MB.
+    /// Multi-segment TS mode (byte-range segments from a concatenated file).
     init(streamer: FileStreamer, segments: [SegmentInfo]) throws {
         self.streamer = streamer
         self.segments = segments
+        self.directoryURL = nil
+        try start()
+    }
+
+    /// Static file directory mode (fMP4). Serves an `index.m3u8` and all segment
+    /// files from a single directory over HTTP. Each URL path is mapped directly
+    /// to the corresponding file on disk.
+    init(directoryURL: URL) throws {
+        self.streamer = nil
+        self.segments = nil
+        self.directoryURL = directoryURL
         try start()
     }
 
@@ -145,6 +161,25 @@ final class LocalHTTPServer: @unchecked Sendable {
 
         let path = parts[1]
 
+        // Directory mode (fMP4): route paths to files on disk.
+        if let dirURL = directoryURL {
+            switch path {
+            case "/playlist.m3u8":
+                serveStaticFile(at: dirURL.appendingPathComponent("index.m3u8"),
+                                contentType: "application/vnd.apple.mpegurl",
+                                on: connection)
+            default:
+                // Strip leading "/" and serve the corresponding file.
+                let relativePath = String(path.dropFirst())
+                let fileURL = dirURL.appendingPathComponent(relativePath)
+                serveStaticFile(at: fileURL,
+                                contentType: "video/mp2t",
+                                on: connection)
+            }
+            return
+        }
+
+        // TS modes (single-segment or multi-segment).
         switch path {
         case "/playlist.m3u8":
             serveManifest(on: connection)
@@ -160,6 +195,110 @@ final class LocalHTTPServer: @unchecked Sendable {
                 sendError(statusCode: 404, on: connection)
             }
         }
+    }
+
+    // MARK: - Static file serving (directory mode / fMP4)
+
+    /// Serves a file from disk. For small files (≤ 16 MB), reads the entire file
+    /// and sends it in one response. For larger files, uses chunked transfer encoding.
+    private func serveStaticFile(at fileURL: URL, contentType: String, on connection: NWConnection) {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            sendError(statusCode: 404, on: connection)
+            return
+        }
+
+        let fileSize: UInt64
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        } catch {
+            sendError(statusCode: 500, on: connection)
+            return
+        }
+
+        // Small files (m3u8, init segments): serve directly.
+        // Segment files are typically 2–10 MB, also fine for direct serving.
+        let maxDirectServe: UInt64 = 16 * 1024 * 1024 // 16 MB
+        if fileSize <= maxDirectServe {
+            do {
+                let data = try Data(contentsOf: fileURL)
+                let responseHeaders: [String: String] = [
+                    "Content-Type": contentType,
+                    "Content-Length": "\(data.count)",
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-cache",
+                ]
+                sendResponse(statusCode: 200, headers: responseHeaders, body: data, on: connection)
+            } catch {
+                sendError(statusCode: 500, on: connection)
+            }
+        } else {
+            // Large file — stream with chunked transfer.
+            streamStaticFileChunked(fileURL: fileURL, contentType: contentType, on: connection)
+        }
+    }
+
+    /// Streams a large static file using chunked transfer encoding, 1 MB at a time.
+    private func streamStaticFileChunked(fileURL: URL, contentType: String, on connection: NWConnection) {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
+            sendError(statusCode: 500, on: connection)
+            return
+        }
+
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nTransfer-Encoding: chunked\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        guard let headData = head.data(using: .utf8) else {
+            try? handle.close()
+            connection.cancel()
+            return
+        }
+
+        connection.send(content: headData, completion: .contentProcessed { [weak self] error in
+            if let error {
+                NSLog("[TSPlayerKit] Head send error: \(error)")
+                try? handle.close()
+                connection.cancel()
+                return
+            }
+            self?.sendNextStaticChunk(handle: handle, on: connection)
+        })
+    }
+
+    /// Recursively sends one chunk of a static file, then schedules the next.
+    private func sendNextStaticChunk(handle: FileHandle, on connection: NWConnection) {
+        let chunkSize = 1024 * 1024 // 1 MB
+        let data = handle.readData(ofLength: chunkSize)
+
+        if data.isEmpty {
+            // End of file — send terminating chunk.
+            try? handle.close()
+            let terminator = Data("0\r\n\r\n".utf8)
+            connection.send(content: terminator, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+            return
+        }
+
+        let hexSize = String(format: "%X\r\n", data.count)
+        guard let hexData = hexSize.data(using: .utf8) else {
+            try? handle.close()
+            connection.cancel()
+            return
+        }
+
+        var chunkMessage = Data()
+        chunkMessage.append(hexData)
+        chunkMessage.append(data)
+        chunkMessage.append(Data("\r\n".utf8))
+
+        connection.send(content: chunkMessage, completion: .contentProcessed { [weak self] error in
+            if let error {
+                NSLog("[TSPlayerKit] Chunk send error: \(error)")
+                try? handle.close()
+                connection.cancel()
+                return
+            }
+            self?.sendNextStaticChunk(handle: handle, on: connection)
+        })
     }
 
     // MARK: - Manifest
@@ -236,6 +375,7 @@ final class LocalHTTPServer: @unchecked Sendable {
         let requestedLength = end - start + 1
 
         Task { [streamer] in
+            guard let streamer else { connection.cancel(); return }
             do {
                 let data = try await streamer.readBytes(offset: start, length: requestedLength)
 
@@ -280,6 +420,7 @@ final class LocalHTTPServer: @unchecked Sendable {
     /// If the client sends a Range header (seeking), the response is capped to the
     /// requested range — no chunked encoding needed for small seek probes.
     private func serveLegacySegment(rangeHeader: String?, on connection: NWConnection) {
+        guard let streamer else { connection.cancel(); return }
         let fileSize = streamer.fileSize
 
         guard fileSize > 0 else {
@@ -386,7 +527,8 @@ final class LocalHTTPServer: @unchecked Sendable {
 
         let readLen = min(remaining, chunkLimit)
 
-        Task { [streamer] in
+        Task { [weak self] in
+            guard let self, let streamer = self.streamer else { connection.cancel(); return }
             let chunk: Data
             do {
                 chunk = try await streamer.readBytes(offset: offset, length: readLen)
