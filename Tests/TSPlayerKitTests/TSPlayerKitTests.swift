@@ -74,6 +74,38 @@ struct HLSManifestGeneratorTests {
         #expect(playlist.contains("#EXT-X-TARGETDURATION:2"))
         #expect(playlist.contains("#EXTINF:2.000,"))
     }
+
+    @Test("SegmentInfo with file field round-trips through JSON")
+    func segmentInfoFileFieldJSONRoundTrip() throws {
+        let segments = [
+            SegmentInfo(offset: 0,    duration: 2.0, length: 188, file: "video_000.ts"),
+            SegmentInfo(offset: 0,    duration: 2.0, length: 200, file: "video_001.ts"),
+            SegmentInfo(offset: 200,  duration: 2.0, length: 188, file: "video_001.ts"),
+        ]
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(segments)
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode([SegmentInfo].self, from: data)
+
+        #expect(decoded.count == 3)
+        #expect(decoded[0].file == "video_000.ts")
+        #expect(decoded[1].file == "video_001.ts")
+        #expect(decoded[2].file == "video_001.ts")
+        #expect(decoded[0].offset == 0)
+        #expect(decoded[1].offset == 0)   // new file, offset resets
+        #expect(decoded[2].offset == 200) // same file, offset continues
+    }
+
+    @Test("SegmentInfo decodes nil file from old-format JSON")
+    func segmentInfoNilFileBackwardCompat() throws {
+        let oldJSON = """
+        [{"offset":0,"duration":2.0,"length":188}]
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode([SegmentInfo].self, from: oldJSON)
+        #expect(decoded.count == 1)
+        #expect(decoded[0].file == nil)
+        #expect(decoded[0].offset == 0)
+    }
 }
 
 // MARK: - FileStreamer Tests
@@ -337,6 +369,69 @@ struct LocalHTTPServerTests {
         #expect(httpResponse.statusCode == 404)
     }
 
+    // MARK: Multi-file TS mode
+
+    @Test("Multi-file server serves segments from correct streamer")
+    func multiFileServerServesFromCorrectFile() async throws {
+        // Two files: file0 with 0xAA, file1 with 0xBB.
+        let seg0 = Data(repeating: 0xAA, count: 200)
+        let seg1 = Data(repeating: 0xBB, count: 200)
+        let file0URL = try makeTempFile(content: seg0)
+        let file1URL = try makeTempFile(content: seg1)
+        defer {
+            try? FileManager.default.removeItem(at: file0URL)
+            try? FileManager.default.removeItem(at: file1URL)
+        }
+
+        let streamer0 = try FileStreamer(fileURL: file0URL)
+        let streamer1 = try FileStreamer(fileURL: file1URL)
+
+        let segments = [
+            SegmentInfo(offset: 0, duration: 2.0, length: 200, file: file0URL.lastPathComponent),
+            SegmentInfo(offset: 0, duration: 2.0, length: 200, file: file1URL.lastPathComponent),
+        ]
+        let server = try LocalHTTPServer(
+            streamers: [file0URL.lastPathComponent: streamer0, file1URL.lastPathComponent: streamer1],
+            segments: segments
+        )
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        // Request segment 0 (should get 0xAA from file0).
+        let url0 = URL(string: "http://127.0.0.1:\(server.port)/segment_0.ts")!
+        let (data0, response0) = try await URLSession.shared.data(from: url0)
+        #expect((response0 as! HTTPURLResponse).statusCode == 200)
+        #expect(data0 == seg0)
+
+        // Request segment 1 (should get 0xBB from file1).
+        let url1 = URL(string: "http://127.0.0.1:\(server.port)/segment_1.ts")!
+        let (data1, response1) = try await URLSession.shared.data(from: url1)
+        #expect((response1 as! HTTPURLResponse).statusCode == 200)
+        #expect(data1 == seg1)
+    }
+
+    @Test("Multi-file server returns 404 for out-of-range index")
+    func multiFileServerOutOfRange() async throws {
+        let content = Data(repeating: 0x47, count: 188)
+        let fileURL = try makeTempFile(content: content)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let streamer = try FileStreamer(fileURL: fileURL)
+        let segments = [
+            SegmentInfo(offset: 0, duration: 2.0, length: 188, file: fileURL.lastPathComponent),
+        ]
+        let server = try LocalHTTPServer(
+            streamers: [fileURL.lastPathComponent: streamer],
+            segments: segments
+        )
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        let url = URL(string: "http://127.0.0.1:\(server.port)/segment_99.ts")!
+        let (_, response) = try await URLSession.shared.data(from: url)
+        #expect((response as! HTTPURLResponse).statusCode == 404)
+    }
+
     // MARK: Directory mode (fMP4)
 
     @Test("Directory mode server serves index.m3u8 and segment files")
@@ -461,6 +556,63 @@ struct TSPlayerItemTests {
         #expect(asset != nil)
         #expect(asset?.url.scheme == "http")
         #expect(asset?.url.path == "/playlist.m3u8")
+    }
+
+    // MARK: Multi-file TS tests
+
+    @MainActor
+    @Test("Multi-file init succeeds with two files")
+    func multiFileInit() throws {
+        let dirURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("multifile_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+
+        // Create two TS files in the directory.
+        let seg0 = Data(repeating: 0xAA, count: 200)
+        let seg1 = Data(repeating: 0xBB, count: 200)
+        try seg0.write(to: dirURL.appendingPathComponent("video_000.ts"))
+        try seg1.write(to: dirURL.appendingPathComponent("video_001.ts"))
+
+        let segments = [
+            SegmentInfo(offset: 0,   duration: 2.0, length: 200, file: "video_000.ts"),
+            SegmentInfo(offset: 0,   duration: 2.0, length: 200, file: "video_001.ts"),
+        ]
+        let tsItem = try TSPlayerItem(tsFilesDirectory: dirURL, segments: segments)
+        let asset = tsItem.playerItem.asset as? AVURLAsset
+        #expect(asset != nil)
+        #expect(asset?.url.scheme == "http")
+        #expect(asset?.url.host == "127.0.0.1")
+        #expect(asset?.url.path == "/playlist.m3u8")
+    }
+
+    @MainActor
+    @Test("Multi-file init throws with empty segments")
+    func multiFileInitEmptySegments() {
+        let dirURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("multifile_empty_test_\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+
+        #expect(throws: TSPlayerItemError.self) {
+            _ = try TSPlayerItem(tsFilesDirectory: dirURL, segments: [])
+        }
+    }
+
+    @MainActor
+    @Test("Multi-file init throws when segments lack file field")
+    func multiFileInitMissingFileField() {
+        let dirURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("multifile_nofile_test_\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+
+        let segments = [
+            SegmentInfo(offset: 0, duration: 2.0, length: 200),  // file = nil
+        ]
+        #expect(throws: TSPlayerItemError.self) {
+            _ = try TSPlayerItem(tsFilesDirectory: dirURL, segments: segments)
+        }
     }
 }
 

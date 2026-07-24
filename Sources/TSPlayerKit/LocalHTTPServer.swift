@@ -6,6 +6,7 @@ final class LocalHTTPServer: @unchecked Sendable {
     private enum Mode {
         case legacyTS(streamer: FileStreamer)
         case multiSegmentTS(streamer: FileStreamer, segments: [SegmentInfo])
+        case multiFileTS(streamers: [String: FileStreamer], segments: [SegmentInfo])
         case staticDirectory(url: URL)
     }
 
@@ -28,6 +29,11 @@ final class LocalHTTPServer: @unchecked Sendable {
 
     init(streamer: FileStreamer, segments: [SegmentInfo]) throws {
         mode = .multiSegmentTS(streamer: streamer, segments: segments)
+        try start()
+    }
+
+    init(streamers: [String: FileStreamer], segments: [SegmentInfo]) throws {
+        mode = .multiFileTS(streamers: streamers, segments: segments)
         try start()
     }
 
@@ -119,6 +125,19 @@ final class LocalHTTPServer: @unchecked Sendable {
             case "/playlist.m3u8": serveManifest(on: connection)
             default:
                 if let idx = parseSegmentIndex(from: path) {
+                    serveSegment(streamer: streamer, segments: segments, index: idx,
+                                 rangeHeader: rangeHeader, on: connection)
+                } else { sendQuick(404, on: connection) }
+            }
+        case .multiFileTS(let streamers, let segments):
+            switch path {
+            case "/playlist.m3u8": serveManifest(on: connection)
+            default:
+                if let idx = parseSegmentIndex(from: path), idx < segments.count {
+                    let seg = segments[idx]
+                    guard let filename = seg.file, let streamer = streamers[filename] else {
+                        sendQuick(500, on: connection); return
+                    }
                     serveSegment(streamer: streamer, segments: segments, index: idx,
                                  rangeHeader: rangeHeader, on: connection)
                 } else { sendQuick(404, on: connection) }
