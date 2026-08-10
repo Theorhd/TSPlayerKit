@@ -204,8 +204,11 @@ Erreurs pouvant survenir lors de la lecture du fichier.
 
 ```
 Sources/TSPlayerKit/
-├── TSPlayerItem.swift              ← API publique (wrapper)
-├── LocalHTTPServer.swift           ← Serveur HTTP local (NWListener) — iOS 17+
+├── TSPlayerItem.swift              ← API publique (wrapper lecture locale)
+├── AdStrippingProxy.swift          ← Proxy HLS anti-pub (v1.1.0)
+├── HLSPlaylistCleaner.swift        ← Détection de pubs + rewriting de playlist
+├── RemotePlaylistFetcher.swift     ← Fetch HTTP distant (playlists + segments)
+├── LocalHTTPServer.swift           ← Serveur HTTP local (NWListener)
 ├── HLSManifestGenerator.swift      ← Génération du .m3u8 virtuel
 └── FileStreamer.swift              ← Lecture disque asynchrone (FileHandle)
 ```
@@ -213,6 +216,9 @@ Sources/TSPlayerKit/
 | Composant | Rôle |
 |---|---|
 | `TSPlayerItem` | Wrapper qui démarre le serveur, génère le manifest et assemble l'`AVPlayerItem` |
+| `AdStrippingProxy` | Proxy HTTP local qui nettoie les pubs d'un flux HLS distant |
+| `HLSPlaylistCleaner` | Détection des segments publicitaires (CUE, patterns URL, durées) et réécriture des playlists |
+| `RemotePlaylistFetcher` | Fetch HTTP de playlists et segments depuis un CDN distant (via URLSession) |
 | `LocalHTTPServer` | Serveur HTTP local basé sur `NWListener` : sert le manifest et les segments TS via HTTP standard |
 | `HLSManifestGenerator` | Génère la chaîne `.m3u8` avec les URLs `http://127.0.0.1:[port]/...` |
 | `FileStreamer` | Lecture thread-safe du fichier via `FileHandle`, avec support byte-range pour le seek |
@@ -232,12 +238,43 @@ Sources/TSPlayerKit/
 
 ---
 
+## Ad Blocking — Proxy HLS local
+
+Depuis la version 1.1.0, TSPlayerKit inclut `AdStrippingProxy`, un proxy HTTP local qui nettoie les flux HLS en retirant les segments publicitaires avant de les passer à AVPlayer.
+
+```swift
+import TSPlayerKit
+
+// 1. Créer un fetcher (avec les headers requis par la source)
+let fetcher = RemotePlaylistFetcher(
+    userAgent: "Mozilla/5.0 ...",
+    extraHeaders: ["Client-Id": "xxx"]
+)
+
+// 2. Démarrer le proxy sur un flux distant
+let streamURL = URL(string: "https://usher.ttvnw.net/...")!
+let proxy = try AdStrippingProxy(remoteURL: streamURL, fetcher: fetcher)
+
+// 3. Lire via le proxy (pense à garder une référence forte !)
+let player = AVPlayer(playerItem: AVPlayerItem(asset: AVURLAsset(url: proxy.localURL)))
+player.play()
+```
+
+**Fonctionnement** : le proxy expose `http://127.0.0.1:{port}/master.m3u8`. AVPlayer lit depuis cette URL locale. Le proxy fetch le flux original, détecte et retire les pubs (tags SCTE35/CUE, patterns d'URL, heuristiques de durée), puis sert un playlist nettoyé.
+
+**Modes de segments** :
+- `.stream` (défaut) — le proxy fetch et relaye les bytes des segments
+- `.redirect` — HTTP 302 vers le CDN original (moins de bandwidth, mais AVPlayer peut mal le gérer)
+
+---
+
 ## Limitations
 
 - **Un seul segment** — La playlist ne déclare qu'un seul segment TS. Pour des vidéos multi-segments, le manifeste devrait être enrichi.
 - **Pas de chiffrement** — Les fichiers doivent être en clair (pas de FairPlay DRM).
 - **Performances disque** — `FileHandle` lit de manière synchrone sur une queue dédiée. Pour des fichiers très volumineux (>10 Go), le seek peut introduire une latence perceptible.
 - **Codecs supportés** — Dépend des capacités d'`AVFoundation` sur l'appareil. Les codecs non supportés par la plateforme ne seront pas lus.
+- **Proxy HLS** — La détection des pubs est conservatrice. Certaines pubs utilisant le SSAI sans marqueurs peuvent ne pas être détectées.
 
 ---
 
