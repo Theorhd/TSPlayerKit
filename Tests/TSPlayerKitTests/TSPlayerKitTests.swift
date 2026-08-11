@@ -714,8 +714,8 @@ struct HLSPlaylistCleanerTests {
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
         #expect(result.adSegmentCount == 0)
         #expect(!result.adReplaced)
-        #expect(result.playlist.contains("seg/0/0.ts"))
-        #expect(result.playlist.contains("seg/1/1.ts"))
+        #expect(result.playlist.contains("seg/0.ts"))
+        #expect(result.playlist.contains("seg/1.ts"))
         // The raw "0.ts" on its own line must not survive.
         #expect(!result.playlist.contains("\n0.ts\n"))
     }
@@ -747,11 +747,12 @@ struct HLSPlaylistCleanerTests {
         #expect(result.removedIndices.contains(2))
         #expect(!result.removedIndices.contains(0))
         #expect(!result.removedIndices.contains(3))
-        // Index 3 segment (original) survives but is now at rewritten position after removals;
-        // it appears as /seg/3/3.ts (original index preserved).
-        #expect(result.playlist.contains("/seg/3/3.ts"))
+        // Segment URLs are filename-keyed (stable across reloads).
+        #expect(result.playlist.contains("/seg/3.ts"))
         #expect(!result.playlist.contains("ad1.ts"))
-        #expect(result.playlist.contains("#EXT-X-DISCONTINUITY"))
+        // No discontinuity: the surviving content has continuous PTS, and a
+        // discontinuity at the live edge stalls AVPlayer.
+        #expect(!result.playlist.contains("#EXT-X-DISCONTINUITY"))
     }
 
     // ── SCTE35-OUT with duration (no SCTE35-IN) — bounded removal ──
@@ -878,8 +879,9 @@ struct HLSPlaylistCleanerTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        // Live — keep removal. Empty playlist → AVPlayer polls again.
-        #expect(result.adSegmentCount == 2)
+        // Live full-ad window: keep the last segment so the playlist is never
+        // empty — an empty playlist triggers -12888 on the next poll.
+        #expect(result.adSegmentCount == 1)
     }
 
     // ── URL-pattern detection ──
@@ -952,7 +954,7 @@ struct HLSPlaylistCleanerTests {
 
     // ── LL-HLS tag stripping ──
 
-    @Test("cleanVariantPlaylist strips low-latency HLS tags")
+    @Test("cleanVariantPlaylist strips low-latency HLS tags but keeps degraded SERVER-CONTROL")
     func cleanStripsLLHLSTags() {
         let variant = """
         #EXTM3U
@@ -970,14 +972,19 @@ struct HLSPlaylistCleanerTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        #expect(!result.playlist.contains("SERVER-CONTROL"))
+        // SERVER-CONTROL is preserved, but CAN-BLOCK-RELOAD is forced to NO.
+        #expect(result.playlist.contains("CAN-BLOCK-RELOAD=NO"))
+        #expect(!result.playlist.contains("CAN-BLOCK-RELOAD=YES"))
+        // PART-INF is dropped too — it signals LL-HLS capability to AVPlayer,
+        // which may trigger blocking reloads even without CAN-BLOCK-RELOAD=YES.
         #expect(!result.playlist.contains("PART-INF"))
+        // Content-carrying PART entries, PRELOAD-HINT, and RENDITION-REPORT are stripped.
         #expect(!result.playlist.contains("#EXT-X-PART:"))
         #expect(!result.playlist.contains("PRELOAD-HINT"))
         #expect(!result.playlist.contains("RENDITION-REPORT"))
         // Content segments survive.
-        #expect(result.playlist.contains("/seg/0/0.ts"))
-        #expect(result.playlist.contains("/seg/1/1.ts"))
+        #expect(result.playlist.contains("seg/0.ts"))
+        #expect(result.playlist.contains("seg/1.ts"))
         #expect(result.adSegmentCount == 0)
     }
 
@@ -1004,6 +1011,43 @@ struct HLSPlaylistCleanerTests {
         #expect(result.adSegmentCount == 0)
     }
 
+    @Test("cleanVariantPlaylist strips PROGRAM-DATE-TIME (regression: -16831)")
+    func cleanStripsProgramDateTime() {
+        // Live playlist with slate substitution. The PDT of the newest
+        // (live-edge) segments survives on slate placeholders; if it reaches
+        // AVPlayer, the start time lands inside the live-edge threshold →
+        // CoreMedia -16831 "START-TIME is too close to live" → stall.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:00.000Z
+        #EXTINF:2.000,
+        content0.ts
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:02.000Z
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:04.000Z
+        #EXTINF:2.000,
+        ad2.ts
+        #EXT-X-CUE-IN
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:06.000Z
+        #EXTINF:2.000,
+        content1.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+        #expect(!result.playlist.contains("PROGRAM-DATE-TIME"))
+        // Content and slate entries survive (no MEDIA-SEQUENCE in this fixture
+        // → global index = position: 1, 2).
+        #expect(result.playlist.contains("seg/content0.ts"))
+        #expect(result.playlist.contains("/slate/1.ts"))
+        #expect(result.playlist.contains("/slate/2.ts"))
+        #expect(result.playlist.contains("seg/content1.ts"))
+    }
+
     // ── #EXT-X-MAP (fMP4 init) rewriting ──
 
     @Test("cleanVariantPlaylist rewrites #EXT-X-MAP URIs through proxy")
@@ -1024,10 +1068,14 @@ struct HLSPlaylistCleanerTests {
         #expect(!result.playlist.contains("URI=\"init.mp4\""))
     }
 
-    // ── Discontinuity insertion ──
+    // ── Discontinuity behavior ──
 
-    @Test("cleanVariantPlaylist inserts DISCONTINUITY after ad block")
-    func cleanDiscontinuityAfterAd() {
+    @Test("cleanVariantPlaylist does not insert DISCONTINUITY around an ad block")
+    func cleanNoDiscontinuityAfterAd() {
+        // Removed (or slate-replaced) ads leave the surviving content on both
+        // sides with continuous PTS — the player skips the gap natively. An
+        // explicit discontinuity at the live edge makes AVPlayer stall, so the
+        // cleaner must NOT insert one.
         let variant = """
         #EXTM3U
         #EXT-X-TARGETDURATION:2
@@ -1045,17 +1093,14 @@ struct HLSPlaylistCleanerTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        #expect(result.playlist.contains("#EXT-X-DISCONTINUITY"))
-        // The DISCONTINUITY sits between the surviving before and after segments.
+        #expect(!result.playlist.contains("#EXT-X-DISCONTINUITY"))
         let lines = result.playlist.components(separatedBy: .newlines)
-        let discIdx = lines.firstIndex(of: "#EXT-X-DISCONTINUITY")
-        #expect(discIdx != nil)
         let beforeIdx = lines.firstIndex(where: { $0.contains("before.ts") })
         let afterIdx = lines.firstIndex(where: { $0.contains("after.ts") })
         #expect(beforeIdx != nil)
         #expect(afterIdx != nil)
-        #expect(discIdx! > beforeIdx!)
-        #expect(discIdx! < afterIdx!)
+        // Both content segments survive; the ads in between are gone.
+        #expect(beforeIdx! < afterIdx!)
     }
 
     // ── segmentFilename ──
@@ -1107,6 +1152,397 @@ struct HLSPlaylistCleanerTests {
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
         // KEY URI is NOT rewritten — AVPlayer fetches it directly.
         #expect(result.playlist.contains("URI=\"https://cdn.example.com/key.bin\""))
+    }
+}
+
+// MARK: - Slate substitution Tests
+
+@Suite("SlateSubstitution")
+struct SlateSubstitutionTests {
+
+    let cleaner = HLSPlaylistCleaner()
+
+    @Test("Live ad segments are replaced with slate URLs, not removed")
+    func liveAdsReplacedWithSlate() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MEDIA-SEQUENCE:100
+        #EXTINF:2.000,
+        seg100.ts
+        #EXT-X-DATERANGE:ID="stitched-ad-1",CLASS="twitch-stitched-ad",DURATION=4.0
+        #EXTINF:2.000,
+        ad101.ts
+        #EXTINF:2.000,
+        ad102.ts
+        #EXTINF:2.000,
+        seg103.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+
+        #expect(result.adSegmentCount == 2)
+        #expect(result.replacedIndices == [1, 2])
+        #expect(result.removedIndices.isEmpty)
+        #expect(result.adReplaced)
+
+        // Ad URLs are gone; slate placeholders took their slot. Slate URLs are
+        // the GLOBAL indices (MEDIA-SEQUENCE 100 + position): 101, 102.
+        #expect(!result.playlist.contains("ad101.ts"))
+        #expect(!result.playlist.contains("ad102.ts"))
+        #expect(result.playlist.contains("/slate/101.ts"))
+        #expect(result.playlist.contains("/slate/102.ts"))
+
+        // Media sequence is preserved so AVPlayer sees the playlist advancing.
+        #expect(result.playlist.contains("#EXT-X-MEDIA-SEQUENCE:100"))
+
+        // The slate run carries NO discontinuities: the proxy shifts each
+        // copy's PTS onto the content timeline, and a discontinuity at the
+        // live edge stalls AVPlayer (empirically verified).
+        let lines = result.playlist.components(separatedBy: .newlines)
+        let contentIdx = lines.firstIndex(where: { $0.contains("seg100.ts") })
+        let slate1Idx = lines.firstIndex(where: { $0.contains("/slate/101.ts") })
+        let slate2Idx = lines.firstIndex(where: { $0.contains("/slate/102.ts") })
+        let resumeIdx = lines.firstIndex(where: { $0.contains("seg103.ts") })
+        #expect(contentIdx != nil && slate1Idx != nil && slate2Idx != nil && resumeIdx != nil)
+        let discontinuities = lines.indices.filter { lines[$0] == "#EXT-X-DISCONTINUITY" }
+        #expect(discontinuities.isEmpty)
+    }
+
+    @Test("Full-ad live window becomes all-slate, never empty (regression: -12888)")
+    func fullAdWindowBecomesSlate() {
+        // The -12888 case: during a live ad break the whole sliding window is
+        // ads. Removal produced an empty playlist and AVPlayer aborted after
+        // 1.5 × TARGETDURATION. Slate substitution must keep it populated.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MEDIA-SEQUENCE:200
+        #EXT-X-CUE-OUT:30.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        #EXTINF:2.000,
+        ad3.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+
+        #expect(result.replacedIndices == [0, 1, 2])
+        #expect(result.removedIndices.isEmpty)
+        // Every original slot is still a playable segment (global indices
+        // 200 + position).
+        #expect(result.playlist.contains("/slate/200.ts"))
+        #expect(result.playlist.contains("/slate/201.ts"))
+        #expect(result.playlist.contains("/slate/202.ts"))
+        let segmentLines = result.playlist.components(separatedBy: .newlines).filter {
+            let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !t.isEmpty && !t.hasPrefix("#")
+        }
+        #expect(segmentLines.count == 3)
+    }
+
+    @Test("Slate EXTINF matches the slate duration, not the ad duration")
+    func slateExtinfAligned() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-CUE-OUT:30.0
+        #EXTINF:6.000,
+        ad1.ts
+        #EXTINF:2.000,
+        content.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate", slateDuration: 2.0
+        )
+
+        let lines = result.playlist.components(separatedBy: .newlines)
+        guard let slateIdx = lines.firstIndex(where: { $0.contains("/slate/0.ts") }) else {
+            Issue.record("Expected a slate URL in the rewritten playlist")
+            return
+        }
+        #expect(lines[slateIdx - 1] == "#EXTINF:2.000,")
+    }
+
+    @Test("VOD ignores slate — ad segments are still removed")
+    func vodStillRemoves() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        content.ts
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        #EXT-X-CUE-IN
+        #EXTINF:2.000,
+        content2.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+
+        #expect(result.removedIndices == [1, 2])
+        #expect(result.replacedIndices.isEmpty)
+        #expect(!result.playlist.contains("/slate/"))
+    }
+
+    @Test("fMP4 live playlist (EXT-X-MAP) falls back to removal — TS slate cannot mix with init map")
+    func fmp4FallsBackToRemoval() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MAP:URI="init.mp4"
+        #EXTINF:2.000,
+        seg0.m4s
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.m4s
+        #EXTINF:2.000,
+        ad2.m4s
+        #EXT-X-CUE-IN
+        #EXTINF:2.000,
+        seg3.m4s
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+
+        // fMP4 live: fail-open — keep ad segments (can't substitute TS slate
+        // under an active init-map). The user sees the ad but the stream survives.
+        #expect(result.removedIndices.isEmpty)
+        #expect(result.replacedIndices.isEmpty)
+    }
+
+    @Test("Encrypted stream: slate run closes and reopens the key scope")
+    func slateClosesAndReopensKeyScope() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-KEY:METHOD=AES-128,URI="https://cdn.example.com/key.bin"
+        #EXTINF:2.000,
+        seg0.ts
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        #EXT-X-CUE-IN
+        #EXTINF:2.000,
+        seg3.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+
+        let lines = result.playlist.components(separatedBy: .newlines)
+        let keyNoneIdx = lines.firstIndex(of: "#EXT-X-KEY:METHOD=NONE")
+        let slateIdx = lines.firstIndex(where: { $0.contains("/slate/1.ts") })
+        #expect(keyNoneIdx != nil)
+        #expect(slateIdx != nil)
+        #expect(keyNoneIdx! < slateIdx!)
+
+        // The original key is re-emitted before content resumes.
+        let keyReemitIdx = lines.lastIndex(where: { $0.contains("URI=\"https://cdn.example.com/key.bin\"") })
+        let resumeIdx = lines.firstIndex(where: { $0.contains("seg3.ts") })
+        #expect(keyReemitIdx != nil)
+        #expect(resumeIdx != nil)
+        #expect(keyReemitIdx! > slateIdx!)
+        #expect(keyReemitIdx! < resumeIdx!)
+    }
+
+    @Test("Without slatePathPrefix, live removal behavior is unchanged")
+    func noSlatePrefixKeepsRemoval() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // Without slate, ads are removed — but the last segment is kept to
+        // prevent an empty playlist that triggers -12888 on polls.
+        #expect(result.removedIndices == [0])
+        #expect(result.replacedIndices.isEmpty)
+        #expect(!result.playlist.contains("/slate/"))
+    }
+}
+
+// MARK: - AdStrippingProxy slate route Tests
+
+@Suite("AdStrippingProxy")
+struct AdStrippingProxyTests {
+
+    @Test("Embedded slate segment is available and TS-aligned")
+    func slateAssetIsValid() {
+        #expect(SlateSegment.isAvailable)
+        let data = SlateSegment.data
+        #expect(data != nil)
+        #expect(data!.count > 0)
+        #expect(data!.count % 188 == 0)        // whole MPEG-TS packets
+        #expect(data!.first == 0x47)           // sync byte
+    }
+
+    @Test("SlateRewriter: standard PES layout with PTS at position×duration")
+    func slateRewriterLayout() throws {
+        let raw = try #require(SlateSegment.data)
+        // delta = 3 × 2 s × 90 kHz — a copy at playlist position 3.
+        let rewritten = try #require(SlateRewriter.rewrite(raw, adding: 540_000))
+
+        // Same packet count; the rewrite only touches PES header bytes.
+        #expect(rewritten.count == raw.count)
+
+        // Find the first video PES and its PTS. The REWRITTEN copy carries it
+        // at the standard payload+8; the RAW asset keeps it at payload+9
+        // (non-standard layout — exactly what the rewriter fixes).
+        func firstVideoPTS(_ data: Data, ptsOffset: Int) -> (flagsOffset: Int, pts: Int64)? {
+            var i = 0
+            while i + 188 <= data.count {
+                if data[i] == 0x47 {
+                    let adaptation = (data[i + 3] >> 4) & 0x03
+                    var payload = i + 4
+                    if adaptation == 2 { i += 188; continue }
+                    if adaptation == 3 { payload += 1 + Int(data[i + 4]) }
+                    if payload + 14 <= i + 188,
+                       data[payload] == 0, data[payload + 1] == 0, data[payload + 2] == 1,
+                       (0xE0...0xEF).contains(data[payload + 3]) {
+                        let off = payload + ptsOffset
+                        let b0 = Int64(data[off]), b1 = Int64(data[off + 1])
+                        let b2 = Int64(data[off + 2]), b3 = Int64(data[off + 3])
+                        let b4 = Int64(data[off + 4])
+                        let pts = ((b0 & 0x0E) << 29) | (b1 << 22) | ((b2 & 0xFE) << 14) | (b3 << 7) | (b4 >> 1)
+                        return (payload + 6, pts)
+                    }
+                }
+                i += 188
+            }
+            return nil
+        }
+
+        let origVideo = try #require(firstVideoPTS(raw, ptsOffset: 9))
+        let newVideo = try #require(firstVideoPTS(rewritten, ptsOffset: 8))
+        #expect(rewritten[newVideo.flagsOffset] == 0xA0, "flags must declare PTS present")
+        #expect(rewritten[newVideo.flagsOffset + 1] == 0x05, "PES header length must be 5")
+        // Shifted by the delta, preserving the asset's own base offset.
+        #expect(newVideo.pts == origVideo.pts + 540_000,
+                "PTS must be shifted by exactly the delta (got \(newVideo.pts), expected \(origVideo.pts + 540_000))")
+    }
+
+    @Test("/slate/ route serves the placeholder segment over HTTP")
+    func slateRouteServesSegment() async throws {
+        let fetcher = RemotePlaylistFetcher(userAgent: "TSPlayerKitTests")
+        let proxy = try AdStrippingProxy(
+            remoteURL: URL(string: "https://example.com/unused.m3u8")!,
+            fetcher: fetcher
+        )
+        defer { proxy.stop() }
+
+        let slateURL = URL(string: "http://127.0.0.1:\(proxy.localURL.port!)/slate/5.ts")!
+        let (data, response) = try await URLSession.shared.data(from: slateURL)
+        let httpResponse = response as! HTTPURLResponse
+
+        #expect(httpResponse.statusCode == 200)
+        #expect(httpResponse.value(forHTTPHeaderField: "Content-Type") == "video/mp2t")
+        // The served copy is the REWRITTEN slate (standard PES layout, PTS at
+        // position×2s), not the raw asset — AVPlayer needs the rewritten form.
+        #expect(data != SlateSegment.data)
+        #expect(data.count == SlateSegment.data?.count)
+        #expect(data.first == 0x47)
+        if let raw = SlateSegment.data {
+            // Both start on the same transport packets — only PES headers differ.
+            let deltaCount = zip(data, raw).filter { $0 != $1 }.count
+            #expect(deltaCount < 64, "Expected only PES header bytes to differ, got \(deltaCount)")
+        }
+    }
+
+    @Test("End-to-end: live ad break flows through the proxy as slate segments")
+    func endToEndLiveAdBreak() async throws {
+        // Simulate the Twitch CDN with a local static server: one live variant
+        // playlist whose window contains a stitched-ad break.
+        let dirURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("adproxy_e2e_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+
+        let originVariant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MEDIA-SEQUENCE:100
+        #EXTINF:2.000,
+        seg100.ts
+        #EXT-X-DATERANGE:ID="stitched-ad-1",CLASS="twitch-stitched-ad",DURATION=4.0
+        #EXTINF:2.000,
+        ad101.ts
+        #EXTINF:2.000,
+        ad102.ts
+        #EXTINF:2.000,
+        seg103.ts
+        """
+        try originVariant.write(to: dirURL.appendingPathComponent("index.m3u8"),
+                                atomically: true, encoding: .utf8)
+        let contentBytes = Data(repeating: 0x47, count: 376)
+        try contentBytes.write(to: dirURL.appendingPathComponent("seg100.ts"))
+        try contentBytes.write(to: dirURL.appendingPathComponent("seg103.ts"))
+
+        let origin = try LocalHTTPServer(directoryURL: dirURL)
+        defer { origin.stop() }
+
+        let fetcher = RemotePlaylistFetcher(userAgent: "TSPlayerKitTests")
+        let proxy = try AdStrippingProxy(
+            remoteURL: URL(string: "http://127.0.0.1:\(origin.port)/playlist.m3u8")!,
+            fetcher: fetcher
+        )
+        defer { proxy.stop() }
+        let base = "http://127.0.0.1:\(proxy.localURL.port!)"
+
+        // Master: single-variant input → synthesized master pointing at /variant/0.
+        let (masterData, masterResp) = try await URLSession.shared.data(from: URL(string: "\(base)/master.m3u8")!)
+        #expect((masterResp as! HTTPURLResponse).statusCode == 200)
+        let master = String(data: masterData, encoding: .utf8)!
+        #expect(master.contains("#EXT-X-STREAM-INF"))
+        #expect(master.contains("/variant/0.m3u8"))
+
+        // Variant: ads replaced by slate, content proxied, sequence preserved.
+        // Segment URLs keep the original index: /seg/{variant}/{index}/{file}.
+        let (variantData, variantResp) = try await URLSession.shared.data(from: URL(string: "\(base)/variant/0.m3u8")!)
+        #expect((variantResp as! HTTPURLResponse).statusCode == 200)
+        let variant = String(data: variantData, encoding: .utf8)!
+        #expect(variant.contains("#EXT-X-MEDIA-SEQUENCE:100"))
+        #expect(!variant.contains("ad101.ts"))
+        #expect(!variant.contains("ad102.ts"))
+        #expect(variant.contains("/slate/101.ts"))
+        #expect(variant.contains("/slate/102.ts"))
+        #expect(variant.contains("/seg/0/seg100.ts"))
+        #expect(variant.contains("/seg/0/seg103.ts"))
+
+        // The slate placeholder is served locally — as the REWRITTEN copy
+        // (standard PES layout, PTS shifted by 101 × 2 s = 202 s).
+        let (slateData, slateResp) = try await URLSession.shared.data(from: URL(string: "\(base)/slate/101.ts")!)
+        #expect((slateResp as! HTTPURLResponse).statusCode == 200)
+        #expect(slateData != SlateSegment.data)
+        #expect(slateData.count == SlateSegment.data?.count)
+
+        // …and content segments stream through from the origin untouched.
+        let (segData, segResp) = try await URLSession.shared.data(from: URL(string: "\(base)/seg/0/seg100.ts")!)
+        #expect((segResp as! HTTPURLResponse).statusCode == 200)
+        #expect(segData == contentBytes)
     }
 }
 
