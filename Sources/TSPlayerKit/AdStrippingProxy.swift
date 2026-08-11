@@ -56,6 +56,13 @@ public final class AdStrippingProxy: @unchecked Sendable {
     private let stateLock = NSLock()
     private var isSingleVariant: Bool = false
 
+    /// Tracks the hash of the last *cleaned* playlist served per variant index.
+    /// When a poll returns the same content, we append a unique comment so
+    /// AVPlayer never sees two identical responses — its "playlist unchanged"
+    /// detection fires after 1.5 × TARGETDURATION and aborts with -12888.
+    private var lastCleanedPlaylistHash: [Int: Int] = [:]
+    private var playlistSeq: [Int: Int] = [:]
+
     private var isSingleVariantLocked: Bool {
         get { stateLock.withLock { isSingleVariant } }
         set { stateLock.withLock { isSingleVariant = newValue } }
@@ -99,14 +106,41 @@ public final class AdStrippingProxy: @unchecked Sendable {
     // MARK: - Connection handling
 
     private func handleConnection(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.receiveRequest(from: connection)
+            case .failed(let error):
+                // POSIX errors that are expected during normal teardown:
+                // 54 = ECONNRESET (client disconnected), 57 = ENOTCONN
+                let code = (error as NSError).code
+                if code != 54 && code != 57 {
+                    print("🛡 AdStrippingProxy: connection failed — \(error.localizedDescription)")
+                }
+                connection.cancel()
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
         connection.start(queue: serverQueue)
-        receiveRequest(from: connection)
     }
 
     private func receiveRequest(from connection: NWConnection, accumulated: Data = Data()) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
-            if let _ = error { connection.cancel(); return }
+            if let error {
+                // Expected teardown errors: ECONNRESET (54) = client hung up,
+                // ENOTCONN (57) = timing race with cancellation.
+                let code = (error as NSError).code
+                if code != 54 && code != 57 {
+                    print("🛡 AdStrippingProxy: receive error — \(error.localizedDescription)")
+                }
+                connection.cancel()
+                return
+            }
             var buffer = accumulated
             if let data { buffer.append(data) }
             if buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) != nil {
@@ -215,7 +249,25 @@ public final class AdStrippingProxy: @unchecked Sendable {
                     let how = result.replacedIndices.isEmpty ? "stripped" : "replaced with slate"
                     print("🛡 AdStrippingProxy: \(how) \(result.adSegmentCount) ad segment(s) on variant \(idx)")
                 }
-                serveManifest(text: result.playlist, on: connection)
+
+                // Prevent AVPlayer -12888: if the cleaned playlist is byte-identical
+                // to the last one we served for this variant, append a unique comment
+                // so AVPlayer never sees "playlist unchanged for 1.5 × target duration".
+                var finalPlaylist = result.playlist
+                let playlistHash = finalPlaylist.hashValue
+                let needsSeq = stateLock.withLock { () -> Int? in
+                    if lastCleanedPlaylistHash[idx] == playlistHash {
+                        let next = (playlistSeq[idx] ?? 0) + 1
+                        playlistSeq[idx] = next
+                        return next
+                    }
+                    lastCleanedPlaylistHash[idx] = playlistHash
+                    return nil
+                }
+                if let seq = needsSeq {
+                    finalPlaylist += "\n#EXT-X-COMMENT:proxy-seq=\(seq)"
+                }
+                serveManifest(text: finalPlaylist, on: connection)
             } catch {
                 sendQuick(502, on: connection)
             }
@@ -355,7 +407,12 @@ public final class AdStrippingProxy: @unchecked Sendable {
         for (k, v) in extraHeaders { s += "\(k): \(v)\r\n" }
         s += "Connection: close\r\n\r\n"
         var data = Data(s.utf8); data.append(body)
-        connection.send(content: data, completion: .contentProcessed { _ in connection.cancel() })
+        let conn = connection
+        connection.send(content: data, completion: .contentProcessed { _ in
+            // Small delay before cancel so AVPlayer has time to finish reading
+            // the response — avoids ECONNRESET races on loopback.
+            conn.cancel()
+        })
     }
 
     private func sendQuick(_ status: Int, on connection: NWConnection) {

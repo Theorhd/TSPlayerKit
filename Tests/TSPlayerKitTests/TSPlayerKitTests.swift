@@ -878,8 +878,9 @@ struct HLSPlaylistCleanerTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        // Live — keep removal. Empty playlist → AVPlayer polls again.
-        #expect(result.adSegmentCount == 2)
+        // Live full-ad window: keep the last segment so the playlist is never
+        // empty — an empty playlist triggers -12888 on the next poll.
+        #expect(result.adSegmentCount == 1)
     }
 
     // ── URL-pattern detection ──
@@ -1278,9 +1279,10 @@ struct SlateSubstitutionTests {
             variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
         )
 
-        #expect(result.removedIndices == [1, 2])
+        // fMP4 live: fail-open — keep ad segments (can't substitute TS slate
+        // under an active init-map). The user sees the ad but the stream survives.
+        #expect(result.removedIndices.isEmpty)
         #expect(result.replacedIndices.isEmpty)
-        #expect(!result.playlist.contains("/slate/"))
     }
 
     @Test("Encrypted stream: slate run closes and reopens the key scope")
@@ -1334,7 +1336,9 @@ struct SlateSubstitutionTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        #expect(result.removedIndices == [0, 1])
+        // Without slate, ads are removed — but the last segment is kept to
+        // prevent an empty playlist that triggers -12888 on polls.
+        #expect(result.removedIndices == [0])
         #expect(result.replacedIndices.isEmpty)
         #expect(!result.playlist.contains("/slate/"))
     }

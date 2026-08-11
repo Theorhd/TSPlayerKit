@@ -149,22 +149,43 @@ struct HLSPlaylistCleaner {
 
         if useSlate {
             replacedIndices = adIndices
+        } else if hasInitMap && !isVOD {
+            // fMP4 live stream: cannot substitute a TS slate segment because the
+            // active `#EXT-X-MAP` init segment declares codec configuration that
+            // a TS container would violate.  Removing ad segments during a full
+            // ad break empties the sliding window, which makes AVPlayer abort
+            // with CoreMediaErrorDomain -12888 ("playlist unchanged").
+            //
+            // Fallback: keep the ad-segment URLs (they remain playable) but
+            // still drop ad-signalling tags so AVPlayer does not treat the break
+            // as a navigation boundary.  The user may see the ad, but the stream
+            // survives — which is the right trade-off until we ship an fMP4 slate.
+            removedIndices = []
+            replacedIndices = []
         } else {
             removedIndices = adIndices
             // --- Fail-open guard ---
             // Never strip (almost) an entire VOD: that means the detection misfired.
             // For live (no ENDLIST) an empty window is legitimate — the whole sliding
-            // window can genuinely be ads — and AVPlayer just keeps polling.
+            // window can genuinely be ads. But removing every segment triggers -12888
+            // (AVPlayer sees the same empty playlist on every poll). Keep at least
+            // one content segment to anchor playback, even if it means one ad
+            // segment survives — better than the stream dying.
             let totalSegments = lines.filter {
                 let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
                 return !t.isEmpty && !t.hasPrefix("#")
             }.count
-            if isVOD, totalSegments > 0, removedIndices.count == totalSegments {
-                // Every single segment looks like an ad — the detection misfired.
-                // Fail-open: better to show ads than serve an empty playlist.
-                // (Live playlists—no ENDLIST—keep the removal; empty windows are
-                // valid HLS there and AVPlayer simply keeps polling.)
-                removedIndices = []
+            if totalSegments > 0, removedIndices.count == totalSegments {
+                if isVOD {
+                    // Every single segment looks like an ad — the detection misfired.
+                    // Fail-open: better to show ads than serve an empty playlist.
+                    removedIndices = []
+                } else {
+                    // Live playlist: the whole window looks like ads.  Keep the
+                    // *last* segment so the playlist is never empty — AVPlayer
+                    // tolerates short playlists but not empty ones.
+                    removedIndices.remove(totalSegments - 1)
+                }
             }
         }
 
