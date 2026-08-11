@@ -8,10 +8,22 @@ import Foundation
 /// closes on an explicit end marker *or* when the declared break duration has been
 /// consumed — so a missing `SCTE35-IN` can never wipe the rest of the playlist.
 ///
+/// What happens to detected ad segments depends on the playlist type:
+/// - **VOD** (`#EXT-X-ENDLIST` present): ad segments are *removed*. The static
+///   window makes removal safe, and playback simply skips the break.
+/// - **Live** (no ENDLIST) with a slate available (`slatePathPrefix != nil`):
+///   ad segments are *replaced* by a local placeholder segment (`/slate/…`).
+///   The playlist keeps the same entry count and its media sequence keeps
+///   advancing, so AVPlayer never sees a stalled/empty playlist — removing all
+///   segments of a full ad-break window used to trigger CoreMediaErrorDomain
+///   -12888 ("Playlist File unchanged for longer than 1.5 × target duration").
+/// - **Live fMP4** (has `#EXT-X-MAP`) or slate unavailable: fall back to
+///   removal — an empty window is valid HLS, and fMP4 cannot mix a TS slate
+///   under an active init-map declaration.
+///
 /// Safety net: if detection would remove (almost) every segment of a VOD playlist,
 /// it is considered a false positive and disabled (`fail-open`) — better to show an
-/// ad than to break playback. For live playlists (no `#EXT-X-ENDLIST`) an empty
-/// window is valid HLS: AVPlayer simply keeps polling until the break is over.
+/// ad than to break playback.
 struct HLSPlaylistCleaner {
 
     /// Safety cap for an ad break whose duration can't be determined (seconds).
@@ -84,21 +96,30 @@ struct HLSPlaylistCleaner {
         let playlist: String
         /// Index set of removed segment positions (0-based, within the original playlist).
         let removedIndices: Set<Int>
-        /// Whether at least one ad segment was removed.
+        /// Index set of segment positions replaced by the slate placeholder
+        /// (live playlists only — see `slatePathPrefix`).
+        let replacedIndices: Set<Int>
+        /// Whether at least one ad segment was removed or replaced.
         let adReplaced: Bool
-        /// Number of ad segments detected and removed.
+        /// Number of ad segments detected (removed + replaced).
         let adSegmentCount: Int
     }
 
-    /// Cleans a variant playlist by detecting and removing ad segments,
-    /// then rewriting remaining segment URLs to point to the local proxy.
+    /// Cleans a variant playlist by detecting ad segments, then either removing
+    /// them (VOD, or live without slate support) or substituting them with the
+    /// local slate placeholder (live TS streams), and rewriting remaining
+    /// segment URLs to point to the local proxy.
     /// - Parameters:
     ///   - m3u8: The raw variant playlist text.
     ///   - proxyBaseURL: The local proxy base URL.
     ///   - segmentPathPrefix: Prefix for segment proxy paths (e.g. "/seg").
     ///   - initPathPrefix: Prefix for fMP4 init-segment proxy paths (e.g. "/init").
+    ///   - slatePathPrefix: Prefix for slate placeholder paths (e.g. "/slate"),
+    ///     or `nil` to disable slate substitution (ad segments are removed instead).
+    ///   - slateDuration: Duration of the slate segment in seconds — used for the
+    ///     `#EXTINF` of replaced entries.
     /// - Returns: The cleaning result with rewritten playlist.
-    func cleanVariantPlaylist(_ m3u8: String, proxyBaseURL: String, segmentPathPrefix: String = "/seg", initPathPrefix: String = "/init") -> CleanResult {
+    func cleanVariantPlaylist(_ m3u8: String, proxyBaseURL: String, segmentPathPrefix: String = "/seg", initPathPrefix: String = "/init", slatePathPrefix: String? = nil, slateDuration: Double = SlateSegment.duration) -> CleanResult {
         let lines = m3u8.components(separatedBy: .newlines)
 
         // --- Phase 1: detect ad segments ---
@@ -107,23 +128,44 @@ struct HLSPlaylistCleaner {
         let urlRemoved = detectURLPatternAds(lines: lines)
         let durationRemoved = detectDurationAnomalies(lines: lines)
 
-        var removedIndices = markedRemoved.union(urlRemoved).union(durationRemoved)
+        let adIndices = markedRemoved.union(urlRemoved).union(durationRemoved)
 
-        // --- Fail-open guard ---
-        // Never strip (almost) an entire VOD: that means the detection misfired.
-        // For live (no ENDLIST) an empty window is legitimate — the whole sliding
-        // window can genuinely be ads — and AVPlayer just keeps polling.
-        let totalSegments = lines.filter {
-            let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !t.isEmpty && !t.hasPrefix("#")
-        }.count
+        // --- Decide removal vs. slate substitution ---
+        //
+        // Slate substitution is what makes live ad blocking robust: during a
+        // full ad break the sliding window is 100% ads, and deleting every
+        // segment produces an empty playlist. AVPlayer aborts such a stream
+        // with CoreMediaErrorDomain -12888 after 1.5 × TARGETDURATION. Swapping
+        // in placeholder segments keeps the window populated and advancing.
+        //
+        // It is only safe for MPEG-TS live streams: an fMP4 playlist declares
+        // `#EXT-X-MAP` init segments whose scope would cover the TS slate.
         let isVOD = m3u8.contains("#EXT-X-ENDLIST")
-        if isVOD, totalSegments > 0, removedIndices.count == totalSegments {
-            // Every single segment looks like an ad — the detection misfired.
-            // Fail-open: better to show ads than serve an empty playlist.
-            // (Live playlists—no ENDLIST—keep the removal; empty windows are
-            // valid HLS there and AVPlayer simply keeps polling.)
-            removedIndices = []
+        let hasInitMap = lines.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXT-X-MAP:") }
+        let useSlate = slatePathPrefix != nil && !isVOD && !hasInitMap
+
+        var removedIndices = Set<Int>()
+        var replacedIndices = Set<Int>()
+
+        if useSlate {
+            replacedIndices = adIndices
+        } else {
+            removedIndices = adIndices
+            // --- Fail-open guard ---
+            // Never strip (almost) an entire VOD: that means the detection misfired.
+            // For live (no ENDLIST) an empty window is legitimate — the whole sliding
+            // window can genuinely be ads — and AVPlayer just keeps polling.
+            let totalSegments = lines.filter {
+                let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !t.isEmpty && !t.hasPrefix("#")
+            }.count
+            if isVOD, totalSegments > 0, removedIndices.count == totalSegments {
+                // Every single segment looks like an ad — the detection misfired.
+                // Fail-open: better to show ads than serve an empty playlist.
+                // (Live playlists—no ENDLIST—keep the removal; empty windows are
+                // valid HLS there and AVPlayer simply keeps polling.)
+                removedIndices = []
+            }
         }
 
         // --- Phase 2: rewrite ---
@@ -131,16 +173,20 @@ struct HLSPlaylistCleaner {
         let rewritten = rewriteVariantLines(
             lines: lines,
             removedIndices: removedIndices,
+            replacedIndices: replacedIndices,
             proxyBaseURL: proxyBaseURL,
             segmentPathPrefix: segmentPathPrefix,
-            initPathPrefix: initPathPrefix
+            initPathPrefix: initPathPrefix,
+            slatePathPrefix: slatePathPrefix,
+            slateDuration: slateDuration
         )
 
         return CleanResult(
             playlist: rewritten,
             removedIndices: removedIndices,
-            adReplaced: !removedIndices.isEmpty,
-            adSegmentCount: removedIndices.count
+            replacedIndices: replacedIndices,
+            adReplaced: !removedIndices.isEmpty || !replacedIndices.isEmpty,
+            adSegmentCount: removedIndices.count + replacedIndices.count
         )
     }
 
@@ -393,19 +439,35 @@ struct HLSPlaylistCleaner {
         return false
     }
 
-    /// Rewrites variant playlist lines: removes ad segments, rewrites remaining URLs.
+    /// Rewrites variant playlist lines: removes ad segments (or substitutes
+    /// them with slate placeholders), rewrites remaining URLs.
     private func rewriteVariantLines(
         lines: [String],
         removedIndices: Set<Int>,
+        replacedIndices: Set<Int>,
         proxyBaseURL: String,
         segmentPathPrefix: String,
-        initPathPrefix: String
+        initPathPrefix: String,
+        slatePathPrefix: String?,
+        slateDuration: Double
     ) -> String {
         var result: [String] = []
         var segmentIndex = 0
         var mapIndex = 0
         var pendingEXTINF: String?
-        var previousSegmentWasRemoved = false
+        var previousSegmentWasAd = false
+        /// `true` while emitting a run of slate placeholder segments.
+        var inSlateRun = false
+        /// Last active decryption key (METHOD ≠ NONE), if any. Slate segments
+        /// are served in the clear, so a slate run closes the key scope with
+        /// `#EXT-X-KEY:METHOD=NONE` and reopens it when content resumes.
+        var activeKeyLine: String?
+
+        func appendDiscontinuityIfNeeded() {
+            if result.last?.trimmingCharacters(in: .whitespacesAndNewlines) != "#EXT-X-DISCONTINUITY" {
+                result.append("#EXT-X-DISCONTINUITY")
+            }
+        }
 
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -413,6 +475,15 @@ struct HLSPlaylistCleaner {
             // Buffer #EXTINF — it is written only if its segment survives.
             if trimmed.hasPrefix("#EXTINF:") {
                 pendingEXTINF = line
+                continue
+            }
+
+            // Track key scope. A key change mid-slate-run is recorded (and
+            // restored on exit) but not emitted — slate is unencrypted.
+            if trimmed.hasPrefix("#EXT-X-KEY:") {
+                activeKeyLine = trimmed.contains("METHOD=NONE") ? nil : line
+                if inSlateRun { continue }
+                result.append(line)
                 continue
             }
 
@@ -459,18 +530,40 @@ struct HLSPlaylistCleaner {
             // --- Segment URL ---
             if removedIndices.contains(segmentIndex) {
                 pendingEXTINF = nil
-                previousSegmentWasRemoved = true
+                previousSegmentWasAd = true
                 segmentIndex += 1
                 continue
             }
 
-            // Content boundary after a removed run: insert a discontinuity
-            // (unless the playlist already has one right there).
-            if previousSegmentWasRemoved {
-                if result.last?.trimmingCharacters(in: .whitespacesAndNewlines) != "#EXT-X-DISCONTINUITY" {
-                    result.append("#EXT-X-DISCONTINUITY")
+            if let slatePathPrefix, replacedIndices.contains(segmentIndex) {
+                if !inSlateRun {
+                    // Entering a slate run: hard boundary before the placeholder…
+                    appendDiscontinuityIfNeeded()
+                    // …and close any encryption scope (slate is in the clear).
+                    if activeKeyLine != nil {
+                        result.append("#EXT-X-KEY:METHOD=NONE")
+                    }
+                    inSlateRun = true
                 }
-                previousSegmentWasRemoved = false
+                // The slate has a fixed duration — align EXTINF with reality.
+                pendingEXTINF = nil
+                result.append("#EXTINF:\(String(format: "%.3f", slateDuration)),")
+                result.append("\(proxyBaseURL)\(slatePathPrefix)/\(segmentIndex).ts")
+                previousSegmentWasAd = true
+                segmentIndex += 1
+                continue
+            }
+
+            // Content boundary after an ad run (removed or replaced): insert a
+            // discontinuity (unless the playlist already has one right there).
+            if previousSegmentWasAd {
+                appendDiscontinuityIfNeeded()
+                if inSlateRun, let key = activeKeyLine {
+                    // Reopen the encryption scope closed for the slate run.
+                    result.append(key)
+                }
+                previousSegmentWasAd = false
+                inSlateRun = false
             }
 
             if let extinf = pendingEXTINF {

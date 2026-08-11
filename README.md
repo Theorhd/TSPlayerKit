@@ -208,6 +208,8 @@ Sources/TSPlayerKit/
 ├── AdStrippingProxy.swift          ← Proxy HLS anti-pub (v1.1.0)
 ├── HLSPlaylistCleaner.swift        ← Détection de pubs + rewriting de playlist
 ├── RemotePlaylistFetcher.swift     ← Fetch HTTP distant (playlists + segments)
+├── SlateSegment.swift              ← Segment placeholder embarqué (live)
+├── Resources/slate.ts              ← Slate MPEG-TS (2 s, noir + silence)
 ├── LocalHTTPServer.swift           ← Serveur HTTP local (NWListener)
 ├── HLSManifestGenerator.swift      ← Génération du .m3u8 virtuel
 └── FileStreamer.swift              ← Lecture disque asynchrone (FileHandle)
@@ -219,6 +221,7 @@ Sources/TSPlayerKit/
 | `AdStrippingProxy` | Proxy HTTP local qui nettoie les pubs d'un flux HLS distant |
 | `HLSPlaylistCleaner` | Détection des segments publicitaires (CUE, patterns URL, durées) et réécriture des playlists |
 | `RemotePlaylistFetcher` | Fetch HTTP de playlists et segments depuis un CDN distant (via URLSession) |
+| `SlateSegment` | Charge le segment placeholder embarqué servi à la place des pubs en live |
 | `LocalHTTPServer` | Serveur HTTP local basé sur `NWListener` : sert le manifest et les segments TS via HTTP standard |
 | `HLSManifestGenerator` | Génère la chaîne `.m3u8` avec les URLs `http://127.0.0.1:[port]/...` |
 | `FileStreamer` | Lecture thread-safe du fichier via `FileHandle`, avec support byte-range pour le seek |
@@ -261,6 +264,13 @@ player.play()
 ```
 
 **Fonctionnement** : le proxy expose `http://127.0.0.1:{port}/master.m3u8`. AVPlayer lit depuis cette URL locale. Le proxy fetch le flux original, détecte et retire les pubs (tags SCTE35/CUE, patterns d'URL, heuristiques de durée), puis sert un playlist nettoyé.
+
+**Traitement des pubs selon le type de flux** :
+- **VOD** — les segments pubs sont *supprimés* de la playlist (le break est sauté).
+- **Live (TS)** — les segments pubs sont *remplacés* par un segment placeholder local (« slate » : 2 s d'écran noir + silence, MPEG-TS embarqué en ressource). Pendant une pause publicitaire, la fenêtre glissante Twitch peut être 100 % pubs : tout supprimer produisait une playlist vide qu'AVPlayer abandonnait après 1,5 × TARGETDURATION (`CoreMediaErrorDomain -12888`). Avec le slate, la playlist avance normalement, la lecture survit à la pause (écran noir) et reprend sur le contenu au `EXT-X-DISCONTINUITY` suivant.
+- **Live fMP4** (`#EXT-X-MAP`) ou ressource slate indisponible — repli sur la suppression (comportement antérieur).
+
+Le slate est servi localement sur `/slate/{index}.ts` (aucun aller-retour réseau). Si le flux est chiffré (`#EXT-X-KEY`), le cleaner ferme la portée de la clé (`METHOD=NONE`) pendant le slate et la ré-ouvre à la reprise du contenu.
 
 **Modes de segments** :
 - `.stream` (défaut) — le proxy fetch et relaye les bytes des segments

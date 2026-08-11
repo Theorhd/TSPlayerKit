@@ -26,7 +26,21 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
 
     /// Fetches a remote HLS playlist (master or variant) and returns its text content
     /// along with the final URL after redirects (needed for resolving relative segment URIs).
+    ///
+    /// Transport-level failures (dropped connection, timeout) get exactly one
+    /// retry after 500 ms — a transient CDN hiccup must not surface to AVPlayer
+    /// as a 502, which it treats as a fatal playlist error. HTTP-level errors
+    /// (4xx/5xx) fail immediately: retrying them just delays the failure signal.
     public func fetchPlaylist(url: URL) async throws -> (text: String, finalURL: URL) {
+        do {
+            return try await performPlaylistFetch(url: url)
+        } catch let error as URLError where error.code != .cancelled {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            return try await performPlaylistFetch(url: url)
+        }
+    }
+
+    private func performPlaylistFetch(url: URL) async throws -> (text: String, finalURL: URL) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         // Playlists must never come from the cache: a cached live media playlist is

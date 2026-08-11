@@ -138,6 +138,8 @@ public final class AdStrippingProxy: @unchecked Sendable {
             serveSegment(path: p, rangeHeader: rangeHeader, on: connection)
         case let p where p.hasPrefix("/init/"):
             serveInit(path: p, on: connection)
+        case let p where p.hasPrefix("/slate/"):
+            serveSlate(on: connection)
         default:
             sendQuick(404, on: connection)
         }
@@ -202,12 +204,16 @@ public final class AdStrippingProxy: @unchecked Sendable {
                     text,
                     proxyBaseURL: "http://127.0.0.1:\(port)",
                     segmentPathPrefix: "/seg/\(idx)",
-                    initPathPrefix: "/init/\(idx)"
+                    initPathPrefix: "/init/\(idx)",
+                    // Live ad breaks are filled with the local slate placeholder so
+                    // the playlist never stalls (CoreMedia -12888). `nil` → removal.
+                    slatePathPrefix: SlateSegment.isAvailable ? "/slate" : nil
                 )
 
                 cacheRedirectMappings(from: text, variantBaseURL: variantFinalURL, variantIdx: idx)
                 if result.adSegmentCount > 0 {
-                    print("🛡 AdStrippingProxy: stripped \(result.adSegmentCount) ad segment(s) from variant \(idx)")
+                    let how = result.replacedIndices.isEmpty ? "stripped" : "replaced with slate"
+                    print("🛡 AdStrippingProxy: \(how) \(result.adSegmentCount) ad segment(s) on variant \(idx)")
                 }
                 serveManifest(text: result.playlist, on: connection)
             } catch {
@@ -246,6 +252,21 @@ public final class AdStrippingProxy: @unchecked Sendable {
         case .stream:
             streamSegment(from: realURL, rangeHeader: nil, on: connection)
         }
+    }
+
+    /// Serves the embedded slate placeholder segment. The path suffix (segment
+    /// index) only exists to keep URLs unique across polls — the bytes are
+    /// always the same, served straight from memory with no network round-trip.
+    private func serveSlate(on connection: NWConnection) {
+        guard let data = SlateSegment.data else {
+            sendQuick(404, on: connection)
+            return
+        }
+        send(status: 200, body: data, extraHeaders: [
+            "Content-Type": "video/mp2t",
+            "Content-Length": "\(data.count)",
+            "Cache-Control": "no-cache",
+        ], on: connection)
     }
 
     // MARK: - Redirect mapping
