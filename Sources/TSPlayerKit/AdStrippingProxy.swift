@@ -105,6 +105,22 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
     // MARK: - Connection handling
 
+    /// Simple armed/disarmed flag so the receive callback can cancel the idle
+    /// watchdog without capturing a non-Sendable `DispatchWorkItem`.
+    private final class IdleWatchdog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var armed = true
+
+        func disarm() {
+            lock.lock(); armed = false; lock.unlock()
+        }
+
+        func isArmed() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return armed
+        }
+    }
+
     private func handleConnection(_ connection: NWConnection) {
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -129,7 +145,17 @@ public final class AdStrippingProxy: @unchecked Sendable {
     }
 
     private func receiveRequest(from connection: NWConnection, accumulated: Data = Data()) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+        // AVPlayer occasionally opens a connection without sending anything
+        // (reachability probe). Drop it after 10 s instead of letting the stack
+        // hold it until its own timeout.
+        let watchdog = IdleWatchdog()
+        serverQueue.asyncAfter(deadline: .now() + 10) { [weak connection, weak watchdog] in
+            guard let watchdog, watchdog.isArmed() else { return }
+            connection?.cancel()
+        }
+
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self, weak watchdog] data, _, isComplete, error in
+            watchdog?.disarm()
             guard let self else { return }
             if let error {
                 // Expected teardown errors: ECONNRESET (54) = client hung up,
@@ -265,7 +291,10 @@ public final class AdStrippingProxy: @unchecked Sendable {
                     return nil
                 }
                 if let seq = needsSeq {
-                    finalPlaylist += "\n#EXT-X-COMMENT:proxy-seq=\(seq)"
+                    // Plain comment line (starts with `#` but not `#EXT`): tags
+                    // we invent would be invalid HLS. Comments change the bytes
+                    // AVPlayer receives so it never sees "unchanged" content.
+                    finalPlaylist += "\n#proxy-seq=\(seq)"
                 }
                 serveManifest(text: finalPlaylist, on: connection)
             } catch {

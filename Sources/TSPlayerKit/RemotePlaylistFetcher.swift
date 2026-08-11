@@ -64,6 +64,16 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
             throw FetchError.decodingFailed
         }
 
+        // Dead or degraded proxies (TTV endpoints, expired usher tokens) can
+        // return HTML/JSON error pages with HTTP 200. Validating the signature
+        // tag turns those into a clean 502 → AVPlayer .failed → app-side
+        // fallback, instead of serving garbage that AVPlayer fails to parse
+        // (CoreMedia -12646 "Playlist parse error").
+        let head = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard head.hasPrefix("#EXTM3U") else {
+            throw FetchError.invalidPlaylist
+        }
+
         // response.url is the final URL after redirects — needed to resolve relative URIs
         return (text, response.url ?? url)
     }
@@ -104,6 +114,7 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
         case invalidResponse
         case httpError(statusCode: Int)
         case decodingFailed
+        case invalidPlaylist
 
         public var errorDescription: String? {
             switch self {
@@ -113,6 +124,8 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
                 return "CDN returned HTTP \(code)."
             case .decodingFailed:
                 return "Failed to decode playlist text."
+            case .invalidPlaylist:
+                return "Response is not a valid HLS playlist (missing #EXTM3U)."
             }
         }
     }

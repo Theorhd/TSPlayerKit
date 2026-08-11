@@ -457,6 +457,14 @@ struct HLSPlaylistCleaner {
         if trimmed.hasPrefix("#EXT-X-DATERANGE:") {
             return classifyAdTag(trimmed) != .none
         }
+        // PROGRAM-DATE-TIME positions no longer match the media once ad segments
+        // are removed or replaced: the tags of the newest (live-edge) segments
+        // survive on slate placeholders, putting the playlist "start time" within
+        // AVPlayer's live-edge threshold → "START-TIME is too close to live"
+        // (CoreMedia -16831) → no buffering, MEDIA_PLAYBACK_STALL.
+        // Without PDT, AVPlayer derives the timeline from MEDIA-SEQUENCE, which
+        // is always deep enough in the past for a live stream.
+        if trimmed.hasPrefix("#EXT-X-PROGRAM-DATE-TIME:") { return true }
         return false
     }
 
@@ -558,14 +566,19 @@ struct HLSPlaylistCleaner {
 
             if let slatePathPrefix, replacedIndices.contains(segmentIndex) {
                 if !inSlateRun {
-                    // Entering a slate run: hard boundary before the placeholder…
-                    appendDiscontinuityIfNeeded()
-                    // …and close any encryption scope (slate is in the clear).
+                    // Entering a slate run: close any encryption scope first
+                    // (slate is in the clear)…
                     if activeKeyLine != nil {
                         result.append("#EXT-X-KEY:METHOD=NONE")
                     }
                     inSlateRun = true
                 }
+                // …then a hard boundary before EVERY slate segment. Every slate
+                // copy is the same file with the same PTS (starts ~1.4s); without
+                // a discontinuity before each one, CoreMedia sees PTS regression
+                // across identical copies and stalls (timebase -12753, then
+                // MEDIA_PLAYBACK_STALL during the whole ad break).
+                appendDiscontinuityIfNeeded()
                 // The slate has a fixed duration — align EXTINF with reality.
                 pendingEXTINF = nil
                 result.append("#EXTINF:\(String(format: "%.3f", slateDuration)),")
@@ -597,29 +610,13 @@ struct HLSPlaylistCleaner {
             segmentIndex += 1
         }
 
-        // Bump TARGETDURATION to at least 6s. The original value (often 2s for
-        // LL-HLS live streams) gives AVPlayer a 1.5× = 3-second window before it
-        // declares the playlist "unchanged" (error -12888). After stripping LL-HLS
-        // tags we are serving standard HLS, which typically uses 6–10s, and the
-        // proxy adds a full round-trip to Twitch on every poll — more breathing
-        // room avoids spurious failures on slow or unstable connections.
-        let minTarget = 6
-        var bumped: [String] = []
-        for line in result {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("#EXT-X-TARGETDURATION:") {
-                if let colon = trimmed.firstIndex(of: ":"),
-                   let value = Int(trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespaces)) {
-                    bumped.append("#EXT-X-TARGETDURATION:\(max(value, minTarget))")
-                } else {
-                    bumped.append(line)
-                }
-            } else {
-                bumped.append(line)
-            }
-        }
-
-        return bumped.joined(separator: "\n")
+        // TARGETDURATION is intentionally left at its original value. Bumping it
+        // (e.g. to 6s) widens AVPlayer's "playlist unchanged" window (1.5 × TD →
+        // -12888) but it equally widens the live-edge threshold behind "START-TIME
+        // is too close to live" (-16831) on short LL-HLS windows. -12888 is now
+        // prevented structurally (never-empty playlists + per-poll variation), so
+        // keeping the true value (2s on Twitch) is the safer trade-off.
+        return result.joined(separator: "\n")
     }
 
     // MARK: - URI helpers

@@ -1010,6 +1010,42 @@ struct HLSPlaylistCleanerTests {
         #expect(result.adSegmentCount == 0)
     }
 
+    @Test("cleanVariantPlaylist strips PROGRAM-DATE-TIME (regression: -16831)")
+    func cleanStripsProgramDateTime() {
+        // Live playlist with slate substitution. The PDT of the newest
+        // (live-edge) segments survives on slate placeholders; if it reaches
+        // AVPlayer, the start time lands inside the live-edge threshold →
+        // CoreMedia -16831 "START-TIME is too close to live" → stall.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:00.000Z
+        #EXTINF:2.000,
+        content0.ts
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:02.000Z
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:04.000Z
+        #EXTINF:2.000,
+        ad2.ts
+        #EXT-X-CUE-IN
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-11T19:00:06.000Z
+        #EXTINF:2.000,
+        content1.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
+        )
+        #expect(!result.playlist.contains("PROGRAM-DATE-TIME"))
+        // Content and slate entries survive.
+        #expect(result.playlist.contains("seg/0/content0.ts"))
+        #expect(result.playlist.contains("/slate/1.ts"))
+        #expect(result.playlist.contains("/slate/2.ts"))
+        #expect(result.playlist.contains("seg/3/content1.ts"))
+    }
+
     // ── #EXT-X-MAP (fMP4 init) rewriting ──
 
     @Test("cleanVariantPlaylist rewrites #EXT-X-MAP URIs through proxy")
@@ -1158,7 +1194,9 @@ struct SlateSubstitutionTests {
         // Media sequence is preserved so AVPlayer sees the playlist advancing.
         #expect(result.playlist.contains("#EXT-X-MEDIA-SEQUENCE:100"))
 
-        // Discontinuities bracket the slate run (content → slate → content).
+        // Discontinuities bracket the slate run AND separate every slate copy
+        // (identical PTS across copies → CoreMedia needs a timebase reset per
+        // segment, otherwise it stalls during the whole ad break).
         let lines = result.playlist.components(separatedBy: .newlines)
         let contentIdx = lines.firstIndex(where: { $0.contains("seg100.ts") })
         let slate1Idx = lines.firstIndex(where: { $0.contains("/slate/1.ts") })
@@ -1166,9 +1204,10 @@ struct SlateSubstitutionTests {
         let resumeIdx = lines.firstIndex(where: { $0.contains("seg103.ts") })
         #expect(contentIdx != nil && slate1Idx != nil && slate2Idx != nil && resumeIdx != nil)
         let discontinuities = lines.indices.filter { lines[$0] == "#EXT-X-DISCONTINUITY" }
-        #expect(discontinuities.count == 2)
+        #expect(discontinuities.count == 3)
         #expect(discontinuities[0] > contentIdx! && discontinuities[0] < slate1Idx!)
-        #expect(discontinuities[1] > slate2Idx! && discontinuities[1] < resumeIdx!)
+        #expect(discontinuities[1] > slate1Idx! && discontinuities[1] < slate2Idx!)
+        #expect(discontinuities[2] > slate2Idx! && discontinuities[2] < resumeIdx!)
     }
 
     @Test("Full-ad live window becomes all-slate, never empty (regression: -12888)")
