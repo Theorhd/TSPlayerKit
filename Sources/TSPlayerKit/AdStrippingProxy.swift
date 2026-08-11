@@ -456,20 +456,63 @@ public final class AdStrippingProxy: @unchecked Sendable {
             isClosedRange = false
         }
 
-        Task {
-            do {
-                let (data, contentType) = try await fetcher.fetchSegment(url: url, rangeHeader: rangeHeader)
-                send(status: isClosedRange ? 206 : 200, body: data, extraHeaders: [
-                    "Content-Type": contentType ?? "video/mp2t",
-                    "Content-Length": "\(data.count)",
+        // STREAM the segment instead of buffering it: AVPlayer aborts a segment
+        // request after ~2 s without a response (CoreMedia -12889) and retries
+        // in a loop, so the response headers must reach it as soon as the CDN
+        // responds (~0.5 s TTFB), not after the full body has downloaded.
+        let state = SegmentStreamState()
+        fetcher.streamSegment(
+            url: url,
+            rangeHeader: rangeHeader,
+            queue: serverQueue,
+            onHeaders: { [weak self] status, length in
+                guard let self else { return }
+                state.responded = true
+                var headers: [String: String] = [
+                    "Content-Type": "video/mp2t",
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-cache",
-                ], on: connection)
-            } catch {
-                print("🛡 AdStrippingProxy: segment fetch failed — \(error.localizedDescription)")
-                sendQuick(502, on: connection)
+                ]
+                if length > 0 { headers["Content-Length"] = "\(length)" }
+                self.sendHeaders(status: isClosedRange ? 206 : status, extraHeaders: headers, on: connection)
+            },
+            onData: { data in
+                connection.send(content: data, completion: .contentProcessed { _ in })
+            },
+            onFinish: { error in
+                if error == nil {
+                    // End of body — close (Connection: close is in the headers).
+                    connection.send(content: nil, completion: .contentProcessed { _ in connection.cancel() })
+                } else if !state.responded {
+                    print("🛡 AdStrippingProxy: segment fetch failed — \(error?.localizedDescription ?? "unknown")")
+                    self.sendQuick(502, on: connection)
+                } else {
+                    // Body truncated mid-stream — the player retries the segment.
+                    connection.cancel()
+                }
             }
+        )
+    }
+
+    /// Tracks whether response headers were already forwarded, so a failed
+    /// download can still produce a clean 502 when nothing was sent yet.
+    private final class SegmentStreamState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _responded = false
+        var responded: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _responded }
+            set { lock.lock(); _responded = newValue; lock.unlock() }
         }
+    }
+
+    /// Sends response headers only — the body follows through subsequent
+    /// `connection.send` calls (segment streaming).
+    private func sendHeaders(status: Int, extraHeaders: [String: String], on connection: NWConnection) {
+        var s = "HTTP/1.1 \(status) \(statusText(status))\r\n"
+        for (k, v) in extraHeaders { s += "\(k): \(v)\r\n" }
+        s += "Connection: close\r\n\r\n"
+        let data = Data(s.utf8)
+        connection.send(content: data, completion: .contentProcessed { _ in })
     }
 
     private func send(status: Int, body: Data, extraHeaders: [String: String], on connection: NWConnection) {

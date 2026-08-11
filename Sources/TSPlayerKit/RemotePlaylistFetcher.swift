@@ -6,6 +6,8 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
 
     private let session: URLSession
     private let extraHeaders: [String: String]
+    private let userAgent: String
+    private let timeout: TimeInterval
 
     /// - Parameters:
     ///   - userAgent: The User-Agent header value.
@@ -13,6 +15,8 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
     ///   - timeout: Request timeout in seconds.
     public init(userAgent: String, extraHeaders: [String: String] = [:], timeout: TimeInterval = 10) {
         self.extraHeaders = extraHeaders
+        self.userAgent = userAgent
+        self.timeout = timeout
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = timeout
         config.timeoutIntervalForResource = 30
@@ -117,6 +121,35 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
         return (data, contentType)
     }
 
+    // MARK: - Segment streaming
+
+    /// Streams a remote segment. `onHeaders` fires as soon as the CDN responds
+    /// — the caller forwards the response headers to AVPlayer IMMEDIATELY,
+    /// because it aborts after ~2 s without a response (CoreMedia -12889).
+    /// Then `onData` delivers the body chunks and `onFinish` fires once, with
+    /// `nil` on success or the transport error otherwise. All callbacks are
+    /// delivered on `queue` in order, before `onFinish` is ever called
+    /// `onHeaders` may or may not have fired.
+    public func streamSegment(
+        url: URL,
+        rangeHeader: String?,
+        queue: DispatchQueue,
+        onHeaders: @escaping @Sendable (Int, Int64) -> Void,
+        onData: @escaping @Sendable (Data) -> Void,
+        onFinish: @escaping @Sendable (Error?) -> Void
+    ) {
+        let streamer = SegmentStreamer(
+            userAgent: userAgent,
+            extraHeaders: extraHeaders,
+            timeout: timeout,
+            queue: queue,
+            onHeaders: onHeaders,
+            onData: onData,
+            onFinish: onFinish
+        )
+        streamer.start(url: url, rangeHeader: rangeHeader)
+    }
+
     // MARK: - Error
 
     public enum FetchError: Error, LocalizedError {
@@ -136,6 +169,89 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
             case .invalidPlaylist:
                 return "Response is not a valid HLS playlist (missing #EXTM3U)."
             }
+        }
+    }
+}
+
+/// Drives a single segment download as a `URLSessionDataDelegate`, forwarding
+/// the response headers as soon as they arrive (before the body finishes
+/// downloading) and then the body chunks. Retains itself until the task
+/// completes, so the caller can fire-and-forget.
+private final class SegmentStreamer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+
+    private let queue: DispatchQueue
+    private let onHeaders: @Sendable (Int, Int64) -> Void
+    private let onData: @Sendable (Data) -> Void
+    private let onFinish: @Sendable (Error?) -> Void
+    private var session: URLSession?
+    private var selfRetain: SegmentStreamer?
+
+    init(
+        userAgent: String,
+        extraHeaders: [String: String],
+        timeout: TimeInterval,
+        queue: DispatchQueue,
+        onHeaders: @escaping @Sendable (Int, Int64) -> Void,
+        onData: @escaping @Sendable (Data) -> Void,
+        onFinish: @escaping @Sendable (Error?) -> Void
+    ) {
+        self.queue = queue
+        self.onHeaders = onHeaders
+        self.onData = onData
+        self.onFinish = onFinish
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = 30
+        config.httpAdditionalHeaders = [
+            "User-Agent": userAgent,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        ]
+        // Delegate callbacks land on `queue`, serialized with the caller's
+        // connection writes.
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    func start(url: URL, rangeHeader: String?) {
+        selfRetain = self
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        // Bypass the cache entirely — segments are large and immutable.
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if let rangeHeader, rangeHeader.lowercased().hasPrefix("bytes=") {
+            request.setValue(rangeHeader, forHTTPHeaderField: "Range")
+        }
+        session?.dataTask(with: request).resume()
+    }
+
+    // MARK: - URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let http = response as? HTTPURLResponse
+        queue.async { [weak self] in
+            self?.onHeaders(http?.statusCode ?? 500, http?.expectedContentLength ?? -1)
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let chunk = data
+        queue.async { [weak self] in
+            self?.onData(chunk)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let finishError = error
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.onFinish(finishError)
+            self.session?.invalidateAndCancel()
+            self.session = nil
+            self.selfRetain = nil
         }
     }
 }

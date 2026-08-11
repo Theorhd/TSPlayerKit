@@ -17,6 +17,12 @@ final class DynamicOriginServer: @unchecked Sendable {
 
     let adStartSegment: Int
     let adSegmentCount: Int
+    /// Content segments whose BODY is delayed (headers arrive immediately, the
+    /// body after `bodyDelay` seconds) — simulates a slow CDN transfer. This
+    /// proves the proxy streams: AVPlayer aborts a segment after 2 s without a
+    /// response (-12889), so a buffering proxy would fail these segments.
+    let bodyDelaySegments: Set<Int>
+    let bodyDelay: TimeInterval
     private let startDate = Date()
     /// Content segment bytes by global index.
     private let segments: [Data]
@@ -31,11 +37,14 @@ final class DynamicOriginServer: @unchecked Sendable {
         return f
     }()
 
-    init(segments: [Data], adData: Data, adStartSegment: Int, adSegmentCount: Int) throws {
+    init(segments: [Data], adData: Data, adStartSegment: Int, adSegmentCount: Int,
+         bodyDelaySegments: Set<Int> = [], bodyDelay: TimeInterval = 2.5) throws {
         self.segments = segments
         self.adData = adData
         self.adStartSegment = adStartSegment
         self.adSegmentCount = adSegmentCount
+        self.bodyDelaySegments = bodyDelaySegments
+        self.bodyDelay = bodyDelay
         let params = NWParameters.tcp
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
         let listener = try NWListener(using: params)
@@ -85,7 +94,9 @@ final class DynamicOriginServer: @unchecked Sendable {
             if let idx {
                 let isAd = idx >= adStartSegment && idx < adStartSegment + adSegmentCount
                 let body = isAd ? adData : (idx < segments.count ? segments[idx] : Data())
-                send(200, body: body, contentType: "video/mp2t", on: connection)
+                let delayed = !isAd && bodyDelaySegments.contains(idx)
+                send(200, body: body, contentType: "video/mp2t",
+                     delayBodyBy: delayed ? bodyDelay : 0, on: connection)
                 return
             }
         }
@@ -120,12 +131,21 @@ final class DynamicOriginServer: @unchecked Sendable {
              contentType: "application/vnd.apple.mpegurl", on: connection)
     }
 
-    private func send(_ status: Int, body: Data, contentType: String, on connection: NWConnection) {
+    private func send(_ status: Int, body: Data, contentType: String,
+                      delayBodyBy: TimeInterval = 0, on connection: NWConnection) {
         let head = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Not Found")\r\n"
             + "Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-        var data = Data(head.utf8)
-        data.append(body)
-        connection.send(content: data, completion: .contentProcessed { _ in connection.cancel() })
+        // Headers first — always immediate — then the body (possibly delayed,
+        // simulating a slow CDN transfer).
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
+        let sendBody = {
+            connection.send(content: body, completion: .contentProcessed { _ in connection.cancel() })
+        }
+        if delayBodyBy > 0 {
+            queue.asyncAfter(deadline: .now() + delayBodyBy, execute: sendBody)
+        } else {
+            sendBody()
+        }
     }
 }
 
@@ -191,7 +211,11 @@ struct AVPlayerLiveIntegrationTests {
             segments: segments,
             adData: SlateSegment.data ?? Data(),
             adStartSegment: 3,
-            adSegmentCount: 5
+            adSegmentCount: 5,
+            // Slow-CDN simulation: segment 1 (early) and segment 9 (after the
+            // break) answer headers immediately but deliver the body 2.5 s
+            // later. A buffering proxy would make AVPlayer abort (-12889).
+            bodyDelaySegments: [1, 9]
         )
         defer { origin.stop() }
 
