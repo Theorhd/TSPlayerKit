@@ -372,17 +372,19 @@ struct HLSPlaylistCleaner {
 
     /// Tags that must not reach the player in their original form:
     /// - ad signaling (CUE-*, ad DATERANGE) and Twitch-private tags
-    /// - `#EXT-X-PART:` entries (content parts — can't strip ads at this granularity)
+    /// - `#EXT-X-PART:` and `#EXT-X-PART-INF` — even the metadata tag signals
+    ///   low-latency HLS capability to AVPlayer, which may trigger blocking
+    ///   reloads that our proxy cannot honor (→ CoreMedia -12888). Stripping
+    ///   both degrades the stream to standard HLS polling, which works correctly.
     /// - `#EXT-X-PRELOAD-HINT`, `#EXT-X-RENDITION-REPORT` (LL-HLS helpers)
     ///
     /// `#EXT-X-SERVER-CONTROL` is NOT dropped — it is rewritten in the variant
-    /// phase to `CAN-BLOCK-RELOAD=NO` so AVPlayer does plain polling instead of
-    /// blocking reloads (which the proxy canʼt honor, causing -12888).
+    /// phase to `CAN-BLOCK-RELOAD=NO` for the same reason.
     private func shouldDropTag(_ trimmed: String) -> Bool {
         if trimmed.hasPrefix("#EXT-X-CUE-") { return true }
         if trimmed.hasPrefix("#EXT-X-TWITCH-") { return true }
         if trimmed.hasPrefix("#EXT-X-PREFETCH") { return true }
-        if trimmed.hasPrefix("#EXT-X-PART:") { return true }
+        if trimmed.hasPrefix("#EXT-X-PART") { return true }   // PART: and PART-INF
         if trimmed.hasPrefix("#EXT-X-PRELOAD-HINT") { return true }
         if trimmed.hasPrefix("#EXT-X-RENDITION-REPORT") { return true }
         if trimmed.hasPrefix("#EXT-X-DATERANGE:") {

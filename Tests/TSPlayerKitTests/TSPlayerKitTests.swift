@@ -973,8 +973,9 @@ struct HLSPlaylistCleanerTests {
         // SERVER-CONTROL is preserved, but CAN-BLOCK-RELOAD is forced to NO.
         #expect(result.playlist.contains("CAN-BLOCK-RELOAD=NO"))
         #expect(!result.playlist.contains("CAN-BLOCK-RELOAD=YES"))
-        // PART-INF is kept (harmless metadata — not a content part).
-        #expect(result.playlist.contains("#EXT-X-PART-INF"))
+        // PART-INF is dropped too — it signals LL-HLS capability to AVPlayer,
+        // which may trigger blocking reloads even without CAN-BLOCK-RELOAD=YES.
+        #expect(!result.playlist.contains("PART-INF"))
         // Content-carrying PART entries, PRELOAD-HINT, and RENDITION-REPORT are stripped.
         #expect(!result.playlist.contains("#EXT-X-PART:"))
         #expect(!result.playlist.contains("PRELOAD-HINT"))
