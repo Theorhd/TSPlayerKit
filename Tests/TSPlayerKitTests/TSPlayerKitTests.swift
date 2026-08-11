@@ -2015,3 +2015,34 @@ struct AdStrippingProxyFailureTests {
     }
 }
 
+// MARK: - RemotePlaylistFetcher Proxy Tests
+
+@Suite("RemotePlaylistFetcher proxy")
+struct RemotePlaylistFetcherProxyTests {
+
+    @Test("No proxy by default — session uses system proxy settings")
+    func defaultHasNoProxy() {
+        let fetcher = RemotePlaylistFetcher(userAgent: "TSPlayerKitTests")
+        #expect(fetcher.proxy == nil)
+        #expect(fetcher.sessionConfiguration.connectionProxyDictionary == nil)
+    }
+
+    @Test("Configured proxy is applied to the session for HTTP and HTTPS")
+    func proxyAppliedToSession() {
+        let proxy = HTTPProxy(host: "proxy.example.com", port: 3128)
+        let fetcher = RemotePlaylistFetcher(userAgent: "TSPlayerKitTests", proxy: proxy)
+        #expect(fetcher.proxy == proxy)
+        let dict = fetcher.sessionConfiguration.connectionProxyDictionary
+        #expect(dict?[kCFNetworkProxiesHTTPEnable] as? Bool == true)
+        #expect(dict?[kCFNetworkProxiesHTTPProxy] as? String == proxy.host)
+        #expect(dict?[kCFNetworkProxiesHTTPPort] as? Int == proxy.port)
+        #if os(macOS)
+        // The HTTPS keys are macOS-only constants: on iOS the HTTP proxy
+        // covers https via CONNECT.
+        #expect(dict?[kCFNetworkProxiesHTTPSEnable] as? Bool == true)
+        #expect(dict?[kCFNetworkProxiesHTTPSProxy] as? String == proxy.host)
+        #expect(dict?[kCFNetworkProxiesHTTPSPort] as? Int == proxy.port)
+        #endif
+    }
+}
+

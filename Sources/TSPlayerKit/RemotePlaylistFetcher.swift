@@ -1,7 +1,9 @@
 import Foundation
 
 /// Fetches remote HLS playlists and media segments from a CDN.
-/// Uses URLSession with configurable User-Agent and optional extra headers.
+/// Uses URLSession with configurable User-Agent, optional extra headers,
+/// and an optional upstream HTTP proxy (see `HTTPProxy`) every request
+/// is relayed through.
 public final class RemotePlaylistFetcher: @unchecked Sendable {
 
     /// Delay before the single retry after a transport-level playlist failure.
@@ -12,23 +14,27 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
     private let extraHeaders: [String: String]
     private let userAgent: String
     private let timeout: TimeInterval
+    /// The upstream proxy every request is relayed through, if any.
+    internal let proxy: HTTPProxy?
 
     /// - Parameters:
     ///   - userAgent: The User-Agent header value.
     ///   - extraHeaders: Additional headers to include in every request (e.g. Client-Id).
     ///   - timeout: Request timeout in seconds.
-    public init(userAgent: String, extraHeaders: [String: String] = [:], timeout: TimeInterval = 10) {
+    ///   - proxy: Optional upstream HTTP proxy relayed through for every request.
+    public init(userAgent: String, extraHeaders: [String: String] = [:], timeout: TimeInterval = 10, proxy: HTTPProxy? = nil) {
         self.extraHeaders = extraHeaders
         self.userAgent = userAgent
         self.timeout = timeout
-        let config = Self.makeConfiguration(userAgent: userAgent, timeout: timeout)
+        self.proxy = proxy
+        let config = Self.makeConfiguration(userAgent: userAgent, timeout: timeout, proxy: proxy)
         self.session = URLSession(configuration: config)
         // Segments stream through ONE long-lived session: TCP/TLS keep-alive
         // between segment requests (~every 2 s) saves a full handshake per segment.
-        self.streamingCenter = StreamingCenter(configuration: Self.makeConfiguration(userAgent: userAgent, timeout: timeout))
+        self.streamingCenter = StreamingCenter(configuration: Self.makeConfiguration(userAgent: userAgent, timeout: timeout, proxy: proxy))
     }
 
-    private static func makeConfiguration(userAgent: String, timeout: TimeInterval) -> URLSessionConfiguration {
+    private static func makeConfiguration(userAgent: String, timeout: TimeInterval, proxy: HTTPProxy?) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = timeout
         config.timeoutIntervalForResource = max(30, 3 * timeout)
@@ -37,6 +43,24 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
         ]
+        if let proxy {
+            // Relay every request through the upstream proxy: plain HTTP goes
+            // directly, HTTPS is tunneled via CONNECT. On iOS the HTTP keys
+            // alone cover HTTPS; the HTTPS keys are macOS-only constants
+            // (unavailable on iOS) and macOS needs them explicitly or https
+            // bypasses the proxy.
+            var proxyDict: [AnyHashable: Any] = [
+                kCFNetworkProxiesHTTPEnable: true,
+                kCFNetworkProxiesHTTPProxy: proxy.host,
+                kCFNetworkProxiesHTTPPort: proxy.port,
+            ]
+            #if os(macOS)
+            proxyDict[kCFNetworkProxiesHTTPSEnable] = true
+            proxyDict[kCFNetworkProxiesHTTPSProxy] = proxy.host
+            proxyDict[kCFNetworkProxiesHTTPSPort] = proxy.port
+            #endif
+            config.connectionProxyDictionary = proxyDict
+        }
         return config
     }
 
@@ -174,6 +198,10 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
         )
         return SegmentStreamHandle { task.cancel() }
     }
+
+    /// Test seam: the configuration the fetcher's sessions were built from,
+    /// so proxy wiring can be asserted without hitting the network.
+    internal var sessionConfiguration: URLSessionConfiguration { session.configuration }
 
     // MARK: - Error
 
