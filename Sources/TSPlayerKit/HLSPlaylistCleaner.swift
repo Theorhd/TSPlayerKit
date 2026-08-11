@@ -370,20 +370,21 @@ struct HLSPlaylistCleaner {
 
     // MARK: - Rewriting
 
-    /// Tags that must not reach the player:
+    /// Tags that must not reach the player in their original form:
     /// - ad signaling (CUE-*, ad DATERANGE) and Twitch-private tags
-    /// - low-latency HLS tags (`#EXT-X-PART`, `PRELOAD-HINT`, `RENDITION-REPORT`,
-    ///   `SERVER-CONTROL`): the proxy cannot honor blocking reloads nor strip ads at
-    ///   part granularity, so the player is degraded to plain playlist polling,
-    ///   which the segment-level cleaning handles correctly.
+    /// - `#EXT-X-PART:` entries (content parts — can't strip ads at this granularity)
+    /// - `#EXT-X-PRELOAD-HINT`, `#EXT-X-RENDITION-REPORT` (LL-HLS helpers)
+    ///
+    /// `#EXT-X-SERVER-CONTROL` is NOT dropped — it is rewritten in the variant
+    /// phase to `CAN-BLOCK-RELOAD=NO` so AVPlayer does plain polling instead of
+    /// blocking reloads (which the proxy canʼt honor, causing -12888).
     private func shouldDropTag(_ trimmed: String) -> Bool {
         if trimmed.hasPrefix("#EXT-X-CUE-") { return true }
         if trimmed.hasPrefix("#EXT-X-TWITCH-") { return true }
         if trimmed.hasPrefix("#EXT-X-PREFETCH") { return true }
-        if trimmed.hasPrefix("#EXT-X-PART") { return true }
+        if trimmed.hasPrefix("#EXT-X-PART:") { return true }
         if trimmed.hasPrefix("#EXT-X-PRELOAD-HINT") { return true }
         if trimmed.hasPrefix("#EXT-X-RENDITION-REPORT") { return true }
-        if trimmed.hasPrefix("#EXT-X-SERVER-CONTROL") { return true }
         if trimmed.hasPrefix("#EXT-X-DATERANGE:") {
             return classifyAdTag(trimmed) != .none
         }
@@ -415,10 +416,22 @@ struct HLSPlaylistCleaner {
 
             if shouldDropTag(trimmed) { continue }
 
-            // Non-URL tags — preserve; rewrite only #EXT-X-MAP URIs (fMP4 init).
+            // Non-URL tags — preserve; rewrite #EXT-X-MAP URIs (fMP4 init)
+            // and #EXT-X-SERVER-CONTROL (disable blocking reload).
             // #EXT-X-KEY URIs are intentionally left untouched: keys are fetched
             // directly, and proxying them is both useless and a playback risk.
             if trimmed.hasPrefix("#") {
+                // Rewrite SERVER-CONTROL to disable blocking playlist reload.
+                // AVPlayer sends `?_HLS_msn=N` params when CAN-BLOCK-RELOAD=YES,
+                // expecting the server to hold the connection. Our proxy responds
+                // immediately → AVPlayer perceives an "unchanged" playlist →
+                // CoreMedia error -12888. Plain polling avoids this entirely.
+                if trimmed.hasPrefix("#EXT-X-SERVER-CONTROL:") {
+                    let rewritten = trimmed
+                        .replacingOccurrences(of: "CAN-BLOCK-RELOAD=YES", with: "CAN-BLOCK-RELOAD=NO")
+                    result.append(rewritten)
+                    continue
+                }
                 if trimmed.hasPrefix("#EXT-X-MAP:URI=\"") {
                     if let rewritten = rewritingURIAttribute(
                         of: line,

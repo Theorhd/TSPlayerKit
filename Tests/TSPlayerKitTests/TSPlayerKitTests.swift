@@ -952,7 +952,7 @@ struct HLSPlaylistCleanerTests {
 
     // ── LL-HLS tag stripping ──
 
-    @Test("cleanVariantPlaylist strips low-latency HLS tags")
+    @Test("cleanVariantPlaylist strips low-latency HLS tags but keeps degraded SERVER-CONTROL")
     func cleanStripsLLHLSTags() {
         let variant = """
         #EXTM3U
@@ -970,14 +970,18 @@ struct HLSPlaylistCleanerTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        #expect(!result.playlist.contains("SERVER-CONTROL"))
-        #expect(!result.playlist.contains("PART-INF"))
+        // SERVER-CONTROL is preserved, but CAN-BLOCK-RELOAD is forced to NO.
+        #expect(result.playlist.contains("CAN-BLOCK-RELOAD=NO"))
+        #expect(!result.playlist.contains("CAN-BLOCK-RELOAD=YES"))
+        // PART-INF is kept (harmless metadata — not a content part).
+        #expect(result.playlist.contains("#EXT-X-PART-INF"))
+        // Content-carrying PART entries, PRELOAD-HINT, and RENDITION-REPORT are stripped.
         #expect(!result.playlist.contains("#EXT-X-PART:"))
         #expect(!result.playlist.contains("PRELOAD-HINT"))
         #expect(!result.playlist.contains("RENDITION-REPORT"))
         // Content segments survive.
-        #expect(result.playlist.contains("/seg/0/0.ts"))
-        #expect(result.playlist.contains("/seg/1/1.ts"))
+        #expect(result.playlist.contains("seg/0/0.ts"))
+        #expect(result.playlist.contains("seg/1/1.ts"))
         #expect(result.adSegmentCount == 0)
     }
 
