@@ -29,6 +29,9 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
     public func fetchPlaylist(url: URL) async throws -> (text: String, finalURL: URL) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        // Playlists must never come from the cache: a cached live media playlist is
+        // a stale sliding window whose segments have already expired (404 storm).
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         for (key, value) in extraHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -55,6 +58,9 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
     public func fetchSegment(url: URL, range: NSRange? = nil) async throws -> (data: Data, contentType: String?) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        // Bypass the cache entirely — segments are large and immutable, caching
+        // them in URLCache only fills the disk for no reuse benefit.
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         for (key, value) in extraHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }

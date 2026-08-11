@@ -56,6 +56,11 @@ public final class AdStrippingProxy: @unchecked Sendable {
     private let stateLock = NSLock()
     private var isSingleVariant: Bool = false
 
+    private var isSingleVariantLocked: Bool {
+        get { stateLock.withLock { isSingleVariant } }
+        set { stateLock.withLock { isSingleVariant = newValue } }
+    }
+
     // MARK: - Server lifecycle
 
     private func start() throws {
@@ -139,7 +144,7 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
                 // Detect if this is already a variant playlist (no #EXT-X-STREAM-INF)
                 if !text.contains("#EXT-X-STREAM-INF:") {
-                    isSingleVariant = true
+                    isSingleVariantLocked = true
                     stateLock.withLock { variantURLs = [finalURL] }
                     let fakeMaster = """
                     #EXTM3U
@@ -150,9 +155,14 @@ public final class AdStrippingProxy: @unchecked Sendable {
                     return
                 }
 
-                // Master playlist — rewrite variant URLs
-                let rewritten = cleaner.rewriteMasterPlaylist(text, proxyBaseURL: "http://127.0.0.1:\(port)")
-                stateLock.withLock { variantURLs = extractVariantURLs(from: text) }
+                // Master playlist — rewrite variant URLs (streams + renditions).
+                // The cleaner returns the original URLs in document order; index i
+                // is served back at /variant/<i>.m3u8. Resolve relative URLs against
+                // the final (post-redirect) URL, not the request URL.
+                let base = "http://127.0.0.1:\(port)"
+                let (rewritten, rawVariants) = cleaner.rewriteMasterPlaylist(text, proxyBaseURL: base)
+                let resolved = rawVariants.compactMap { URL(string: $0, relativeTo: finalURL)?.absoluteURL }
+                stateLock.withLock { variantURLs = resolved }
                 serveManifest(text: rewritten, on: connection)
             } catch {
                 sendQuick(502, on: connection)
@@ -171,7 +181,7 @@ public final class AdStrippingProxy: @unchecked Sendable {
         Task {
             do {
                 let variantURL: URL
-                if isSingleVariant {
+                if isSingleVariantLocked {
                     variantURL = remoteURL
                 } else {
                     let urls = stateLock.withLock { variantURLs }
@@ -183,10 +193,14 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 let result = cleaner.cleanVariantPlaylist(
                     text,
                     proxyBaseURL: "http://127.0.0.1:\(port)",
-                    segmentPathPrefix: "/seg"
+                    segmentPathPrefix: "/seg/\(idx)",
+                    initPathPrefix: "/init/\(idx)"
                 )
 
                 cacheRedirectMappings(from: text, variantBaseURL: variantFinalURL, variantIdx: idx)
+                if result.adSegmentCount > 0 {
+                    print("🛡 AdStrippingProxy: stripped \(result.adSegmentCount) ad segment(s) from variant \(idx)")
+                }
                 serveManifest(text: result.playlist, on: connection)
             } catch {
                 sendQuick(502, on: connection)
@@ -228,6 +242,10 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
     // MARK: - Redirect mapping
 
+    /// Maps proxy paths to real CDN URLs. Keys include the variant index
+    /// (`/seg/{variant}/{index}/{file}`) because different qualities reuse the
+    /// same segment filenames — without it, a quality switch would serve the
+    /// previous variant's segments.
     private func cacheRedirectMappings(from originalPlaylist: String, variantBaseURL: URL, variantIdx: Int) {
         let lines = originalPlaylist.components(separatedBy: .newlines)
         var segIdx = 0
@@ -236,19 +254,18 @@ public final class AdStrippingProxy: @unchecked Sendable {
         stateLock.withLock {
             for line in lines {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.hasPrefix("#EXTINF:") { continue }
                 if trimmed.hasPrefix("#EXT-X-MAP:URI=\"") {
                     if let uri = extractURI(from: trimmed),
                        let resolved = URL(string: uri, relativeTo: variantBaseURL)?.absoluteURL {
-                        let filename = uri.components(separatedBy: "/").last ?? uri
-                        segmentRedirects["/init/\(mapIdx)/\(filename)"] = resolved
+                        let filename = HLSPlaylistCleaner.segmentFilename(uri)
+                        segmentRedirects["/init/\(variantIdx)/\(mapIdx)/\(filename)"] = resolved
                         mapIdx += 1
                     }
                     continue
                 }
                 if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
                 if let resolved = URL(string: trimmed, relativeTo: variantBaseURL)?.absoluteURL {
-                    segmentRedirects["/seg/\(segIdx)/\(resolved.lastPathComponent)"] = resolved
+                    segmentRedirects["/seg/\(variantIdx)/\(segIdx)/\(resolved.lastPathComponent)"] = resolved
                 }
                 segIdx += 1
             }
@@ -259,26 +276,6 @@ public final class AdStrippingProxy: @unchecked Sendable {
         guard let start = line.range(of: "URI=\"")?.upperBound,
               let end = line[start...].range(of: "\"")?.lowerBound else { return nil }
         return String(line[start..<end])
-    }
-
-    // MARK: - Variant URL extraction
-
-    private func extractVariantURLs(from master: String) -> [URL] {
-        let lines = master.components(separatedBy: .newlines)
-        var urls: [URL] = []
-        var inTag = false
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("#EXT-X-STREAM-INF:") || trimmed.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") {
-                inTag = true; continue
-            }
-            if inTag, !trimmed.hasPrefix("#"), !trimmed.isEmpty,
-               let url = URL(string: trimmed, relativeTo: remoteURL)?.absoluteURL {
-                urls.append(url)
-            }
-            inTag = false
-        }
-        return urls
     }
 
     // MARK: - Response helpers

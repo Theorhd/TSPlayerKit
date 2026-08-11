@@ -636,3 +636,477 @@ struct FileStreamerErrorTests {
         }
     }
 }
+
+// MARK: - HLSPlaylistCleaner Tests
+
+@Suite("HLSPlaylistCleaner")
+struct HLSPlaylistCleanerTests {
+
+    let cleaner = HLSPlaylistCleaner()
+
+    // ── Master playlist ──
+
+    @Test("rewriteMasterPlaylist replaces variant URLs with proxy paths")
+    func rewriteMasterVariants() {
+        let master = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1920x1080
+        https://cdn.example.com/chunked/index.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=1280x720
+        https://cdn.example.com/720p/index.m3u8
+        """
+
+        let (rewritten, urls) = cleaner.rewriteMasterPlaylist(master, proxyBaseURL: "http://127.0.0.1:9999")
+
+        #expect(rewritten.contains("/variant/0.m3u8"))
+        #expect(rewritten.contains("/variant/1.m3u8"))
+        #expect(!rewritten.contains("cdn.example.com"))
+        #expect(urls.count == 2)
+        #expect(urls[0] == "https://cdn.example.com/chunked/index.m3u8")
+        #expect(urls[1] == "https://cdn.example.com/720p/index.m3u8")
+    }
+
+    @Test("rewriteMasterPlaylist rewrites #EXT-X-MEDIA URIs through proxy")
+    func rewriteMasterMediaURI() {
+        let master = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="English",URI="https://cdn.example.com/audio/index.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=1000000
+        https://cdn.example.com/video/index.m3u8
+        """
+
+        let (rewritten, urls) = cleaner.rewriteMasterPlaylist(master, proxyBaseURL: "http://127.0.0.1:9999")
+
+        // Audio URI rewritten (index 0), video URL rewritten (index 1) — document order.
+        #expect(rewritten.contains("/variant/0.m3u8"))  // audio
+        #expect(rewritten.contains("/variant/1.m3u8"))  // video
+        #expect(urls.count == 2)
+    }
+
+    @Test("rewriteMasterPlaylist drops #EXT-X-I-FRAME-STREAM-INF lines")
+    func rewriteMasterDropsIFrame() {
+        let master = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=1000000
+        https://cdn.example.com/video.m3u8
+        #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=50000,URI="https://cdn.example.com/iframe.m3u8"
+        """
+
+        let (rewritten, urls) = cleaner.rewriteMasterPlaylist(master, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(!rewritten.contains("I-FRAME"))
+        #expect(urls.count == 1)
+    }
+
+    // ── Variant playlist cleaning (no ads) ──
+
+    @Test("cleanVariantPlaylist rewrites segment URLs with proxy prefix")
+    func cleanNoAds() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:10
+        #EXTINF:10.000,
+        0.ts
+        #EXTINF:10.000,
+        1.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.adSegmentCount == 0)
+        #expect(!result.adReplaced)
+        #expect(result.playlist.contains("seg/0/0.ts"))
+        #expect(result.playlist.contains("seg/1/1.ts"))
+        // The raw "0.ts" on its own line must not survive.
+        #expect(!result.playlist.contains("\n0.ts\n"))
+    }
+
+    // ── CUE-OUT / CUE-IN ──
+
+    @Test("cleanVariantPlaylist removes segments between CUE-OUT and CUE-IN")
+    func cleanCueOutIn() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        0.ts
+        #EXT-X-CUE-OUT:30.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        #EXT-X-CUE-IN
+        #EXTINF:2.000,
+        3.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.adSegmentCount == 2)
+        #expect(result.adReplaced)
+        #expect(result.removedIndices.contains(1))
+        #expect(result.removedIndices.contains(2))
+        #expect(!result.removedIndices.contains(0))
+        #expect(!result.removedIndices.contains(3))
+        // Index 3 segment (original) survives but is now at rewritten position after removals;
+        // it appears as /seg/3/3.ts (original index preserved).
+        #expect(result.playlist.contains("/seg/3/3.ts"))
+        #expect(!result.playlist.contains("ad1.ts"))
+        #expect(result.playlist.contains("#EXT-X-DISCONTINUITY"))
+    }
+
+    // ── SCTE35-OUT with duration (no SCTE35-IN) — bounded removal ──
+
+    @Test("cleanVariantPlaylist bounds ad removal by DATERANGE DURATION (no SCTE35-IN)")
+    func cleanSCTE35OutBounded() {
+        // Simulates the Twitch live case where SCTE35-OUT appears without
+        // a matching SCTE35-IN in the same playlist window.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        0.ts
+        #EXT-X-DATERANGE:ID="test",CLASS="scte35",SCTE35-OUT=12345,DURATION=6.0
+        #EXTINF:2.000,
+        1.ts
+        #EXTINF:2.000,
+        2.ts
+        #EXTINF:2.000,
+        3.ts
+        #EXTINF:2.000,
+        4.ts
+        #EXTINF:2.000,
+        5.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+
+        // DURATION=6 → 3 × 2s segments removed, not everything after the marker.
+        #expect(result.adSegmentCount == 3)
+        #expect(result.removedIndices.contains(1))
+        #expect(result.removedIndices.contains(2))
+        #expect(result.removedIndices.contains(3))
+        // Segments 0, 4, 5 must survive.
+        #expect(!result.removedIndices.contains(0))
+        #expect(!result.removedIndices.contains(4))
+        #expect(!result.removedIndices.contains(5))
+    }
+
+    // ── Twitch stitched-ad ──
+
+    @Test("cleanVariantPlaylist detects Twitch stitched-ad DATERANGE")
+    func cleanTwitchStitchedAd() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        content1.ts
+        #EXT-X-DATERANGE:ID="stitched-ad-1234567890",CLASS="twitch-stitched-ad",DURATION=4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        #EXTINF:2.000,
+        content2.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.adSegmentCount == 2)
+        #expect(result.removedIndices.contains(1))
+        #expect(result.removedIndices.contains(2))
+        #expect(!result.removedIndices.contains(0))
+        #expect(!result.removedIndices.contains(3))
+    }
+
+    @Test("cleanVariantPlaylist handles stitched-ad without explicit DURATION (safety cap)")
+    func cleanStitchedAdNoDuration() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        0.ts
+        #EXT-X-DATERANGE:ID="stitched-ad-X",CLASS="twitch-stitched-ad"
+        #EXTINF:2.000,
+        1.ts
+        #EXTINF:2.000,
+        2.ts
+        #EXTINF:2.000,
+        3.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // Without DURATION the cap (180s) applies; 3 segments × 2s = 6s < 180s
+        // — all three are removed.
+        #expect(result.adSegmentCount == 3)
+    }
+
+    // ── Fail-open ──
+
+    @Test("cleanVariantPlaylist fail-open: VOD with all segments removed disables blocking")
+    func cleanFailOpenVOD() {
+        // VOD (has ENDLIST) where every segment somehow matches an ad pattern.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-CUE-OUT:999.0
+        #EXTINF:2.000,
+        0.ts
+        #EXTINF:2.000,
+        1.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // All 2 segments removed → 100% → fail-open → no removal on a VOD.
+        #expect(result.adSegmentCount == 0)
+        #expect(!result.adReplaced)
+    }
+
+    @Test("cleanVariantPlaylist live stream with full-ad window keeps removal")
+    func cleanLiveFullAdWindow() {
+        // Live (no ENDLIST): entire window is ads — legit, keep removal.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-CUE-OUT:30.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // Live — keep removal. Empty playlist → AVPlayer polls again.
+        #expect(result.adSegmentCount == 2)
+    }
+
+    // ── URL-pattern detection ──
+
+    @Test("cleanVariantPlaylist detects ad CDN URL patterns")
+    func cleanURLPatternAds() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        content.ts
+        #EXTINF:2.000,
+        https://cdn.example.com/ads/ad-segment.ts
+        #EXTINF:2.000,
+        content2.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.adSegmentCount == 1)
+        #expect(result.removedIndices.contains(1))
+    }
+
+    // ── Duration anomalies ──
+
+    @Test("cleanVariantPlaylist flags run of anomalous-duration segments")
+    func cleanDurationAnomalies() {
+        // Normal segments: 2s. Ad run: 2 consecutive 6s segments.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:6
+        #EXTINF:2.000,
+        0.ts
+        #EXTINF:2.000,
+        1.ts
+        #EXTINF:6.000,
+        2.ts
+        #EXTINF:6.000,
+        3.ts
+        #EXTINF:2.000,
+        4.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // The two 6s segments should be flagged as an ad run.
+        #expect(result.removedIndices.contains(2))
+        #expect(result.removedIndices.contains(3))
+        #expect(!result.removedIndices.contains(4))
+    }
+
+    @Test("cleanVariantPlaylist does not flag single anomalous-duration segment")
+    func cleanSingleAnomalyNotAd() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:6
+        #EXTINF:2.000,
+        0.ts
+        #EXTINF:6.000,
+        1.ts
+        #EXTINF:2.000,
+        2.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // A single anomalous segment is not a run — not flagged.
+        #expect(!result.removedIndices.contains(1))
+    }
+
+    // ── LL-HLS tag stripping ──
+
+    @Test("cleanVariantPlaylist strips low-latency HLS tags")
+    func cleanStripsLLHLSTags() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.0
+        #EXT-X-PART-INF:PART-TARGET=1.0
+        #EXTINF:2.000,
+        0.ts
+        #EXT-X-PART:DURATION=1.0,URI="part0.ts"
+        #EXTINF:2.000,
+        1.ts
+        #EXT-X-PRELOAD-HINT:TYPE=PART,URI="hint.ts"
+        #EXT-X-RENDITION-REPORT:URI="../variant.m3u8",LAST-MSN=1
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(!result.playlist.contains("SERVER-CONTROL"))
+        #expect(!result.playlist.contains("PART-INF"))
+        #expect(!result.playlist.contains("#EXT-X-PART:"))
+        #expect(!result.playlist.contains("PRELOAD-HINT"))
+        #expect(!result.playlist.contains("RENDITION-REPORT"))
+        // Content segments survive.
+        #expect(result.playlist.contains("/seg/0/0.ts"))
+        #expect(result.playlist.contains("/seg/1/1.ts"))
+        #expect(result.adSegmentCount == 0)
+    }
+
+    // ── Twitch tag stripping ──
+
+    @Test("cleanVariantPlaylist strips Twitch-private tags")
+    func cleanStripsTwitchTags() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TWITCH-ELAPSED-SECS:30.0
+        #EXT-X-TWITCH-TOTAL-SECS:120.0
+        #EXTINF:10.000,
+        0.ts
+        #EXT-X-PREFETCH:https://cdn.example.com/1.ts
+        #EXTINF:10.000,
+        1.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(!result.playlist.contains("TWITCH-ELAPSED"))
+        #expect(!result.playlist.contains("TWITCH-TOTAL"))
+        #expect(!result.playlist.contains("#EXT-X-PREFETCH"))
+        #expect(result.adSegmentCount == 0)
+    }
+
+    // ── #EXT-X-MAP (fMP4 init) rewriting ──
+
+    @Test("cleanVariantPlaylist rewrites #EXT-X-MAP URIs through proxy")
+    func cleanRewritesMapURI() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MAP:URI="init.mp4"
+        #EXTINF:4.000,
+        seg0.m4s
+        #EXTINF:4.000,
+        seg1.m4s
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.playlist.contains("/init/0/init.mp4"))
+        #expect(!result.playlist.contains("URI=\"init.mp4\""))
+    }
+
+    // ── Discontinuity insertion ──
+
+    @Test("cleanVariantPlaylist inserts DISCONTINUITY after ad block")
+    func cleanDiscontinuityAfterAd() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        before.ts
+        #EXT-X-CUE-OUT:4.0
+        #EXTINF:2.000,
+        ad1.ts
+        #EXTINF:2.000,
+        ad2.ts
+        #EXT-X-CUE-IN
+        #EXTINF:2.000,
+        after.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.playlist.contains("#EXT-X-DISCONTINUITY"))
+        // The DISCONTINUITY sits between the surviving before and after segments.
+        let lines = result.playlist.components(separatedBy: .newlines)
+        let discIdx = lines.firstIndex(of: "#EXT-X-DISCONTINUITY")
+        #expect(discIdx != nil)
+        let beforeIdx = lines.firstIndex(where: { $0.contains("before.ts") })
+        let afterIdx = lines.firstIndex(where: { $0.contains("after.ts") })
+        #expect(beforeIdx != nil)
+        #expect(afterIdx != nil)
+        #expect(discIdx! > beforeIdx!)
+        #expect(discIdx! < afterIdx!)
+    }
+
+    // ── segmentFilename ──
+
+    @Test("segmentFilename strips query string")
+    func segmentFilenameStripsQuery() {
+        #expect(HLSPlaylistCleaner.segmentFilename("0.ts?sig=abc") == "0.ts")
+        #expect(HLSPlaylistCleaner.segmentFilename("https://cdn.example.com/path/0.ts?token=x") == "0.ts")
+        #expect(HLSPlaylistCleaner.segmentFilename("https://cdn.example.com/path/0.ts") == "0.ts")
+    }
+
+    // ── CUE-OUT without duration (bare marker) ──
+
+    @Test("cleanVariantPlaylist bare CUE-OUT uses safety cap")
+    func cleanBareCueOut() {
+        // #EXT-X-CUE-OUT with no colon value and no DURATION — safety cap 180s.
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        0.ts
+        #EXT-X-CUE-OUT
+        #EXTINF:2.000,
+        1.ts
+        #EXTINF:2.000,
+        2.ts
+        #EXTINF:2.000,
+        3.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        #expect(result.adSegmentCount == 3)
+    }
+
+    // ── KEY URI left intact ──
+
+    @Test("cleanVariantPlaylist leaves #EXT-X-KEY URIs untouched")
+    func cleanKeyURIIntact() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-KEY:METHOD=AES-128,URI="https://cdn.example.com/key.bin"
+        #EXTINF:4.000,
+        seg0.ts
+        #EXT-X-ENDLIST
+        """
+
+        let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
+        // KEY URI is NOT rewritten — AVPlayer fetches it directly.
+        #expect(result.playlist.contains("URI=\"https://cdn.example.com/key.bin\""))
+    }
+}
+

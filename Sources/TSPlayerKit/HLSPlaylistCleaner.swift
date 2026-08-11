@@ -1,40 +1,79 @@
 import Foundation
 
 /// Parses and cleans HLS playlists — detects ad segments and rewrites URLs.
+///
+/// Ad detection is a single state machine (`detectMarkedAdSegments`) that produces
+/// a set of segment indices to remove. Detection is **bounded**: an ad block opened
+/// by `#EXT-X-CUE-OUT` / `#EXT-X-DATERANGE` (SCTE35-OUT, Twitch `stitched-ad`)
+/// closes on an explicit end marker *or* when the declared break duration has been
+/// consumed — so a missing `SCTE35-IN` can never wipe the rest of the playlist.
+///
+/// Safety net: if detection would remove (almost) every segment of a VOD playlist,
+/// it is considered a false positive and disabled (`fail-open`) — better to show an
+/// ad than to break playback. For live playlists (no `#EXT-X-ENDLIST`) an empty
+/// window is valid HLS: AVPlayer simply keeps polling until the break is over.
 struct HLSPlaylistCleaner {
+
+    /// Safety cap for an ad break whose duration can't be determined (seconds).
+    static let maxAdBlockDuration: Double = 180
 
     // MARK: - Master playlist
 
-    /// Rewrites a master playlist so variant stream URLs point to the local proxy.
+    /// Rewrites a master playlist so every playable URL (variant streams and
+    /// `#EXT-X-MEDIA` renditions, e.g. alternate audio) points to the local proxy.
+    ///
+    /// `#EXT-X-I-FRAME-STREAM-INF` entries are dropped: they are trick-play only,
+    /// and unlike `#EXT-X-STREAM-INF` their URI is an *attribute* (no URL line
+    /// follows) — treating them like regular variants corrupts the playlist.
+    ///
     /// - Parameters:
     ///   - m3u8: The raw master playlist from Twitch.
     ///   - proxyBaseURL: The base URL of the local proxy (e.g. "http://127.0.0.1:54321").
-    /// - Returns: The rewritten playlist.
-    func rewriteMasterPlaylist(_ m3u8: String, proxyBaseURL: String) -> String {
+    /// - Returns: The rewritten playlist plus the original variant URLs, in document
+    ///   order — index `i` is served by the proxy at `/variant/<i>.m3u8`.
+    func rewriteMasterPlaylist(_ m3u8: String, proxyBaseURL: String) -> (playlist: String, variantURLs: [String]) {
         let lines = m3u8.components(separatedBy: .newlines)
         var result: [String] = []
-        var variantIndex = 0
+        var variantURLs: [String] = []
         var inVariantTag = false
 
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { result.append(line); continue }
-            if trimmed.hasPrefix("#EXT-X-STREAM-INF:") || trimmed.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") {
+
+            if trimmed.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") {
+                // Trick-play only — dropped (see docstring).
+                continue
+            }
+
+            if trimmed.hasPrefix("#EXT-X-STREAM-INF:") {
                 inVariantTag = true
                 result.append(line)
                 continue
             }
-            if inVariantTag && !trimmed.hasPrefix("#") {
-                // This is a variant URL — replace with proxy URL
-                result.append("\(proxyBaseURL)/variant/\(variantIndex).m3u8")
-                variantIndex += 1
+
+            // Alternate renditions (audio etc.) embed their URI as an attribute.
+            if trimmed.hasPrefix("#EXT-X-MEDIA:"), trimmed.contains("URI=\""),
+               let rewritten = rewritingURIAttribute(
+                    of: line,
+                    to: "\(proxyBaseURL)/variant/\(variantURLs.count).m3u8"
+               ) {
+                variantURLs.append(extractURI(from: trimmed) ?? "")
+                result.append(rewritten)
+                continue
+            }
+
+            if inVariantTag, !trimmed.hasPrefix("#"), !trimmed.isEmpty {
+                // URL line following an #EXT-X-STREAM-INF tag.
+                variantURLs.append(trimmed)
+                result.append("\(proxyBaseURL)/variant/\(variantURLs.count - 1).m3u8")
                 inVariantTag = false
                 continue
             }
+
             inVariantTag = false
             result.append(line)
         }
-        return result.joined(separator: "\n")
+        return (result.joined(separator: "\n"), variantURLs)
     }
 
     // MARK: - Variant playlist cleaning
@@ -45,8 +84,7 @@ struct HLSPlaylistCleaner {
         let playlist: String
         /// Index set of removed segment positions (0-based, within the original playlist).
         let removedIndices: Set<Int>
-        /// Replacement URLs for removed segments (original URL → replacement URL).
-        /// When empty, the segment was removed entirely.
+        /// Whether at least one ad segment was removed.
         let adReplaced: Bool
         /// Number of ad segments detected and removed.
         let adSegmentCount: Int
@@ -58,22 +96,37 @@ struct HLSPlaylistCleaner {
     ///   - m3u8: The raw variant playlist text.
     ///   - proxyBaseURL: The local proxy base URL.
     ///   - segmentPathPrefix: Prefix for segment proxy paths (e.g. "/seg").
+    ///   - initPathPrefix: Prefix for fMP4 init-segment proxy paths (e.g. "/init").
     /// - Returns: The cleaning result with rewritten playlist.
     func cleanVariantPlaylist(_ m3u8: String, proxyBaseURL: String, segmentPathPrefix: String = "/seg", initPathPrefix: String = "/init") -> CleanResult {
         let lines = m3u8.components(separatedBy: .newlines)
-        var removedIndices = Set<Int>()
-        var adSegmentCount = 0
 
-        // --- Phase 1: Detect ad segments ---
+        // --- Phase 1: detect ad segments ---
 
-        let cueRemoved = detectCueAds(lines: lines)
+        let markedRemoved = detectMarkedAdSegments(lines: lines)
         let urlRemoved = detectURLPatternAds(lines: lines)
         let durationRemoved = detectDurationAnomalies(lines: lines)
 
-        removedIndices = cueRemoved.union(urlRemoved).union(durationRemoved)
-        adSegmentCount = removedIndices.count
+        var removedIndices = markedRemoved.union(urlRemoved).union(durationRemoved)
 
-        // --- Phase 2: Rewrite ---
+        // --- Fail-open guard ---
+        // Never strip (almost) an entire VOD: that means the detection misfired.
+        // For live (no ENDLIST) an empty window is legitimate — the whole sliding
+        // window can genuinely be ads — and AVPlayer just keeps polling.
+        let totalSegments = lines.filter {
+            let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !t.isEmpty && !t.hasPrefix("#")
+        }.count
+        let isVOD = m3u8.contains("#EXT-X-ENDLIST")
+        if isVOD, totalSegments > 0, removedIndices.count == totalSegments {
+            // Every single segment looks like an ad — the detection misfired.
+            // Fail-open: better to show ads than serve an empty playlist.
+            // (Live playlists—no ENDLIST—keep the removal; empty windows are
+            // valid HLS there and AVPlayer simply keeps polling.)
+            removedIndices = []
+        }
+
+        // --- Phase 2: rewrite ---
 
         let rewritten = rewriteVariantLines(
             lines: lines,
@@ -86,66 +139,127 @@ struct HLSPlaylistCleaner {
         return CleanResult(
             playlist: rewritten,
             removedIndices: removedIndices,
-            adReplaced: adSegmentCount > 0,
-            adSegmentCount: adSegmentCount
+            adReplaced: !removedIndices.isEmpty,
+            adSegmentCount: removedIndices.count
         )
+    }
+
+    // MARK: - Ad tag classification
+
+    private enum AdTag: Equatable {
+        /// Opens an ad break; carries the declared break duration if known.
+        case adStart(duration: Double?)
+        /// Closes an ad break.
+        case adEnd
+        /// Not an ad boundary.
+        case none
+    }
+
+    /// Classifies a tag line as an ad-break boundary.
+    ///
+    /// Covers: `#EXT-X-CUE-OUT`/`CUE-IN`, `#EXT-X-CUE-OUT-CONT` (sliding-window
+    /// continuation), and `#EXT-X-DATERANGE` with `SCTE35-OUT`/`SCTE35-IN`,
+    /// Twitch `stitched-ad` / `twitch-stitched-ad`, or `CUE="PRE"`/`CUE="POST"`.
+    private func classifyAdTag(_ line: String) -> AdTag {
+        if line.hasPrefix("#EXT-X-CUE-OUT-CONT") {
+            // Continuation marker inside a sliding window: still in the break.
+            let duration = numericAttribute("Duration", in: line)
+            let elapsed = numericAttribute("ElapsedTime", in: line) ?? 0
+            return .adStart(duration: duration.map { max(0, $0 - elapsed) })
+        }
+        if line.hasPrefix("#EXT-X-CUE-OUT") {
+            return .adStart(duration: parseCueOutDuration(line))
+        }
+        if line.hasPrefix("#EXT-X-CUE-IN") {
+            return .adEnd
+        }
+        if line.hasPrefix("#EXT-X-DATERANGE:") {
+            let lower = line.lowercased()
+            if lower.contains("scte35-in") || lower.contains("cue=\"post\"") {
+                return .adEnd
+            }
+            if lower.contains("scte35-out") || lower.contains("stitched-ad") || lower.contains("cue=\"pre\"") {
+                return .adStart(duration: numericAttribute("DURATION", in: line)
+                                    ?? numericAttribute("PLANNED-DURATION", in: line))
+            }
+        }
+        return .none
+    }
+
+    /// Duration carried by `#EXT-X-CUE-OUT:30.0` or `#EXT-X-CUE-OUT:DURATION=30.0`.
+    private func parseCueOutDuration(_ line: String) -> Double? {
+        guard let colon = line.firstIndex(of: ":") else { return nil }
+        let value = String(line[line.index(after: colon)...])
+        if let d = numericAttribute("DURATION", in: value) { return d }
+        let head = value.components(separatedBy: ",").first ?? value
+        return Double(head.trimmingCharacters(in: .whitespaces))
+    }
+
+    /// Reads a numeric `NAME=value` attribute (case-insensitive) from a tag line.
+    private func numericAttribute(_ name: String, in line: String) -> Double? {
+        guard let range = line.range(of: "\(name)=", options: .caseInsensitive) else { return nil }
+        let token = line[range.upperBound...].prefix(while: { $0.isNumber || $0 == "." })
+        return Double(token)
+    }
+
+    /// Duration of an `#EXTINF:2.000,…` line.
+    private func extinfDuration(_ line: String) -> Double {
+        guard let colon = line.firstIndex(of: ":") else { return 0 }
+        let value = line[line.index(after: colon)...]
+        let head = value.components(separatedBy: ",").first ?? ""
+        return Double(head.trimmingCharacters(in: .whitespaces)) ?? 0
     }
 
     // MARK: - Detection strategies
 
-    /// Detects segments between `#EXT-X-CUE-OUT` and `#EXT-X-CUE-IN` markers.
-    private func detectCueAds(lines: [String]) -> Set<Int> {
+    /// Detects segments inside an ad break delimited by CUE-OUT/CUE-IN or
+    /// DATERANGE (SCTE35 / stitched-ad) markers.
+    ///
+    /// The break is **bounded by its declared duration**: once the accumulated
+    /// `#EXTINF` durations of removed segments reach the break duration, the break
+    /// is considered over even without an explicit end marker. Without this, a
+    /// Twitch playlist that carries `SCTE35-OUT` but no `SCTE35-IN` in the same
+    /// window would cause every following segment to be deleted.
+    private func detectMarkedAdSegments(lines: [String]) -> Set<Int> {
         var removed = Set<Int>()
-        var inAd = false
         var segmentIndex = 0
-        var adStartIndex = -1
+        var inAd = false
+        var adBudget: Double = 0
+        var pendingDuration: Double = 0
 
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            if trimmed.hasPrefix("#EXT-X-CUE-OUT") {
+            switch classifyAdTag(trimmed) {
+            case .adStart(let duration):
                 inAd = true
-                adStartIndex = segmentIndex
+                adBudget = duration ?? Self.maxAdBlockDuration
                 continue
-            }
-
-            if trimmed.hasPrefix("#EXT-X-CUE-IN") {
-                if inAd, adStartIndex >= 0 {
-                    for i in adStartIndex..<segmentIndex {
-                        removed.insert(i)
-                    }
-                }
+            case .adEnd:
                 inAd = false
-                adStartIndex = -1
+                adBudget = 0
                 continue
+            case .none:
+                break
             }
 
-            // Also detect SCTE35 via DATERANGE
-            if trimmed.hasPrefix("#EXT-X-DATERANGE:") {
-                let lower = trimmed.lowercased()
-                if lower.contains("scte35-out") || lower.contains("cue=\"pre\"") || lower.contains("cue=\"post\"") {
-                    inAd = true
-                    adStartIndex = segmentIndex
-                }
-                if lower.contains("scte35-in") {
-                    if inAd, adStartIndex >= 0 {
-                        for i in adStartIndex..<segmentIndex {
-                            removed.insert(i)
-                        }
-                    }
-                    inAd = false
-                    adStartIndex = -1
-                }
-                continue
-            }
-
-            // Count segments: non-# lines after #EXTINF
             if trimmed.hasPrefix("#EXTINF:") {
+                pendingDuration = extinfDuration(trimmed)
                 continue
             }
-            if !trimmed.hasPrefix("#") && !trimmed.isEmpty {
-                segmentIndex += 1
+            if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
+
+            // Segment URL line.
+            if inAd {
+                removed.insert(segmentIndex)
+                adBudget -= pendingDuration
+                if adBudget <= 0 {
+                    inAd = false
+                    adBudget = 0
+                }
             }
+            pendingDuration = 0
+            segmentIndex += 1
         }
 
         return removed
@@ -156,14 +270,15 @@ struct HLSPlaylistCleaner {
         var removed = Set<Int>()
         var segmentIndex = 0
 
+        // Kept deliberately specific — loose patterns ("-ad-", "a/video")
+        // false-positive on content segment hashes and kill playback.
         let adPatterns = [
-            "amazon-ads", "a/video", "/ad/", "-ad-", "twitch-ad",
-            "ads.", ".ads.", "doubleclick", "googlesyndication",
+            "amazon-ads", "/ads/", ".ads.", "ads.", "doubleclick",
+            "googlesyndication", "adserver", "stitched-ad", "/advertisement/",
         ]
 
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("#EXTINF:") { continue }
             if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
 
             let lower = trimmed.lowercased()
@@ -190,11 +305,7 @@ struct HLSPlaylistCleaner {
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.hasPrefix("#EXTINF:") {
-                let durStr = trimmed
-                    .replacingOccurrences(of: "#EXTINF:", with: "")
-                    .replacingOccurrences(of: ",", with: "")
-                    .trimmingCharacters(in: .whitespaces)
-                durations.append(Double(durStr) ?? 0)
+                durations.append(extinfDuration(trimmed))
             }
         }
 
@@ -259,6 +370,26 @@ struct HLSPlaylistCleaner {
 
     // MARK: - Rewriting
 
+    /// Tags that must not reach the player:
+    /// - ad signaling (CUE-*, ad DATERANGE) and Twitch-private tags
+    /// - low-latency HLS tags (`#EXT-X-PART`, `PRELOAD-HINT`, `RENDITION-REPORT`,
+    ///   `SERVER-CONTROL`): the proxy cannot honor blocking reloads nor strip ads at
+    ///   part granularity, so the player is degraded to plain playlist polling,
+    ///   which the segment-level cleaning handles correctly.
+    private func shouldDropTag(_ trimmed: String) -> Bool {
+        if trimmed.hasPrefix("#EXT-X-CUE-") { return true }
+        if trimmed.hasPrefix("#EXT-X-TWITCH-") { return true }
+        if trimmed.hasPrefix("#EXT-X-PREFETCH") { return true }
+        if trimmed.hasPrefix("#EXT-X-PART") { return true }
+        if trimmed.hasPrefix("#EXT-X-PRELOAD-HINT") { return true }
+        if trimmed.hasPrefix("#EXT-X-RENDITION-REPORT") { return true }
+        if trimmed.hasPrefix("#EXT-X-SERVER-CONTROL") { return true }
+        if trimmed.hasPrefix("#EXT-X-DATERANGE:") {
+            return classifyAdTag(trimmed) != .none
+        }
+        return false
+    }
+
     /// Rewrites variant playlist lines: removes ad segments, rewrites remaining URLs.
     private func rewriteVariantLines(
         lines: [String],
@@ -270,74 +401,31 @@ struct HLSPlaylistCleaner {
         var result: [String] = []
         var segmentIndex = 0
         var mapIndex = 0
-        var inAdBlock = false
         var pendingEXTINF: String?
-        var wasAdRemoved = false
-        var nextDiscontinuityNeeded = false
+        var previousSegmentWasRemoved = false
 
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // Handle #EXTINF — buffer it, decide when we see the URL
+            // Buffer #EXTINF — it is written only if its segment survives.
             if trimmed.hasPrefix("#EXTINF:") {
                 pendingEXTINF = line
                 continue
             }
 
-            // Ad marker tags
-            if trimmed.hasPrefix("#EXT-X-CUE-OUT") || trimmed.hasPrefix("#EXT-X-CUE-IN") {
-                if trimmed.hasPrefix("#EXT-X-CUE-OUT") { inAdBlock = true }
-                if trimmed.hasPrefix("#EXT-X-CUE-IN") && inAdBlock {
-                    inAdBlock = false
-                    nextDiscontinuityNeeded = true
-                }
-                // Always strip CUE tags themselves
-                continue
-            }
+            if shouldDropTag(trimmed) { continue }
 
-            // DATERANGE with SCTE35 ad markers
-            if trimmed.hasPrefix("#EXT-X-DATERANGE:") {
-                let lower = trimmed.lowercased()
-                if lower.contains("scte35-out") || lower.contains("cue=\"pre\"") {
-                    inAdBlock = true
-                    continue
-                }
-                if lower.contains("scte35-in") {
-                    if inAdBlock {
-                        inAdBlock = false
-                        nextDiscontinuityNeeded = true
-                    }
-                    continue
-                }
-                // Non-ad DATERANGE — preserve
-                result.append(line)
-                continue
-            }
-
-            // Non-URL tags — preserve, but rewrite MAP/KEY URIs
+            // Non-URL tags — preserve; rewrite only #EXT-X-MAP URIs (fMP4 init).
+            // #EXT-X-KEY URIs are intentionally left untouched: keys are fetched
+            // directly, and proxying them is both useless and a playback risk.
             if trimmed.hasPrefix("#") {
-                // Strip Twitch-specific tags
-                if trimmed.hasPrefix("#EXT-X-TWITCH-") || trimmed.hasPrefix("#EXT-X-PREFETCH") {
-                    continue
-                }
-                // Skip tags that were already handled
-                if trimmed.hasPrefix("#EXT-X-CUE-") || trimmed.hasPrefix("#EXT-X-DATERANGE:") {
-                    continue
-                }
-                // Rewrite #EXT-X-MAP URI to proxy
                 if trimmed.hasPrefix("#EXT-X-MAP:URI=\"") {
-                    if let rewritten = rewriteMapOrKey(line: line, proxyBaseURL: proxyBaseURL, pathPrefix: initPathPrefix, index: mapIndex) {
+                    if let rewritten = rewritingURIAttribute(
+                        of: line,
+                        to: "\(proxyBaseURL)\(initPathPrefix)/\(mapIndex)/\(Self.segmentFilename(extractURI(from: trimmed) ?? ""))"
+                    ) {
                         result.append(rewritten)
                         mapIndex += 1
-                    } else {
-                        result.append(line)
-                    }
-                    continue
-                }
-                // Rewrite #EXT-X-KEY URI to proxy
-                if trimmed.hasPrefix("#EXT-X-KEY:") && trimmed.contains("URI=\"") {
-                    if let rewritten = rewriteMapOrKey(line: line, proxyBaseURL: proxyBaseURL, pathPrefix: "/key", index: mapIndex) {
-                        result.append(rewritten)
                     } else {
                         result.append(line)
                     }
@@ -353,61 +441,57 @@ struct HLSPlaylistCleaner {
                 continue
             }
 
-            // --- This is a segment URL ---
-            let isAd = removedIndices.contains(segmentIndex) || inAdBlock
-
-            if isAd {
-                // Discard the segment and its #EXTINF
+            // --- Segment URL ---
+            if removedIndices.contains(segmentIndex) {
                 pendingEXTINF = nil
-                wasAdRemoved = true
+                previousSegmentWasRemoved = true
                 segmentIndex += 1
                 continue
             }
 
-            // Content segment
-            if wasAdRemoved && nextDiscontinuityNeeded {
-                result.append("#EXT-X-DISCONTINUITY")
-                nextDiscontinuityNeeded = false
+            // Content boundary after a removed run: insert a discontinuity
+            // (unless the playlist already has one right there).
+            if previousSegmentWasRemoved {
+                if result.last?.trimmingCharacters(in: .whitespacesAndNewlines) != "#EXT-X-DISCONTINUITY" {
+                    result.append("#EXT-X-DISCONTINUITY")
+                }
+                previousSegmentWasRemoved = false
             }
-            wasAdRemoved = false
 
             if let extinf = pendingEXTINF {
                 result.append(extinf)
                 pendingEXTINF = nil
             }
 
-            // Rewrite segment URL to proxy
-            let rewrittenURL = "\(proxyBaseURL)\(segmentPathPrefix)/\(segmentIndex)/\(trimmed.components(separatedBy: "/").last ?? trimmed)"
-            result.append(rewrittenURL)
+            let proxyURL = "\(proxyBaseURL)\(segmentPathPrefix)/\(segmentIndex)/\(Self.segmentFilename(trimmed))"
+            result.append(proxyURL)
             segmentIndex += 1
         }
 
-        // Don't leave a dangling EXTINF
-        if let extinf = pendingEXTINF {
-            result.append(extinf)
-        }
-
-        // Update TARGETDURATION if we removed segments (recompute from remaining)
-        var finalResult: [String] = []
-        for line in result {
-            if line.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXT-X-TARGETDURATION:") {
-                // Keep original — AVPlayer handles longer durations fine
-                finalResult.append(line)
-                continue
-            }
-            finalResult.append(line)
-        }
-
-        return finalResult.joined(separator: "\n")
+        return result.joined(separator: "\n")
     }
 
-    /// Rewrites the URI inside `#EXT-X-MAP:URI="..."` or `#EXT-X-KEY:URI="..."` to point to the proxy.
-    private func rewriteMapOrKey(line: String, proxyBaseURL: String, pathPrefix: String, index: Int) -> String? {
+    // MARK: - URI helpers
+
+    /// Last path component of a URL string, without any query string.
+    /// Used for proxy paths — must stay consistent with the redirect cache keys
+    /// in `AdStrippingProxy` (a `?sig=…` suffix in the filename would 404).
+    static func segmentFilename(_ urlString: String) -> String {
+        let noQuery = urlString.components(separatedBy: "?").first ?? urlString
+        return noQuery.components(separatedBy: "/").last ?? noQuery
+    }
+
+    /// Extracts the URI value from a `URI="..."` attribute.
+    private func extractURI(from line: String) -> String? {
+        guard let start = line.range(of: "URI=\"")?.upperBound,
+              let end = line[start...].range(of: "\"")?.lowerBound else { return nil }
+        return String(line[start..<end])
+    }
+
+    /// Replaces the URI value inside a `URI="..."` attribute with a new one.
+    private func rewritingURIAttribute(of line: String, to newURI: String) -> String? {
         guard let uriStart = line.range(of: "URI=\"")?.upperBound,
               let uriEnd = line[uriStart...].range(of: "\"")?.lowerBound else { return nil }
-        let uriString = String(line[uriStart..<uriEnd])
-        let filename = uriString.components(separatedBy: "/").last ?? uriString
-        let proxyURI = "\(proxyBaseURL)\(pathPrefix)/\(index)/\(filename)"
-        return line.replacingCharacters(in: uriStart..<uriEnd, with: proxyURI)
+        return line.replacingCharacters(in: uriStart..<uriEnd, with: newURI)
     }
 }
