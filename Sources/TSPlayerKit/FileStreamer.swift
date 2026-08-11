@@ -46,12 +46,9 @@ final class FileStreamer: @unchecked Sendable {
         }
     }
 
-    deinit {
-        let handle = fileHandle
-        queue.sync {
-            try? handle.close()
-        }
-    }
+    // No custom deinit: FileHandle closes its file descriptor in its own
+    // dealloc. (A previous version ran `queue.sync` from deinit, which crashes
+    // libdispatch if the last strong reference is released on that queue.)
 
     func readBytes(offset: UInt64, length: UInt64) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in

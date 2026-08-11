@@ -8,7 +8,7 @@ import Foundation
 /// CoreMediaErrorDomain -12888 ("Playlist File unchanged for longer than
 /// 1.5 × target duration"). Substituting a short black/silent segment keeps
 /// the playlist advancing: playback survives the break (showing a black frame
-/// with silence) and resumes on real content at the next discontinuity.
+/// with silence) and resumes on real content once the break ends.
 ///
 /// The embedded asset is a 2-second MPEG-TS segment (H.264 640×360 + silent
 /// AAC 48 kHz stereo) matching the Twitch live cadence — content and stitched

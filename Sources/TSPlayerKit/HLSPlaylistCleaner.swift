@@ -22,9 +22,10 @@ import Foundation
 ///   and the proxy rewrites each copy's PTS onto the content timeline, so the
 ///   run is timestamp-continuous and needs no DISCONTINUITY (which itself
 ///   stalls AVPlayer at the live edge).
-/// - **Live fMP4** (has `#EXT-X-MAP`) or slate unavailable: fall back to
-///   removal — an empty window is valid HLS, and fMP4 cannot mix a TS slate
-///   under an active init-map declaration.
+/// - **Live fMP4** (has `#EXT-X-MAP`): ad segments are *kept* (a TS slate
+///   cannot live under an fMP4 init-map declaration, and removing the whole
+///   window would stall the player) — but ad-signalling tags are still dropped.
+///   The user may see the ad; the stream survives.
 ///
 /// Safety net: if detection would remove (almost) every segment of a VOD playlist,
 /// it is considered a false positive and disabled (`fail-open`) — better to show an
@@ -33,6 +34,10 @@ struct HLSPlaylistCleaner {
 
     /// Safety cap for an ad break whose duration can't be determined (seconds).
     static let maxAdBlockDuration: Double = 180
+
+    /// Known ad segment durations (seconds); 10s is excluded — it is the
+    /// standard live content duration on Twitch.
+    private static let knownAdDurations: Set<Double> = [6, 15, 30, 60]
 
     // MARK: - Master playlist
 
@@ -108,6 +113,11 @@ struct HLSPlaylistCleaner {
         let adReplaced: Bool
         /// Number of ad segments detected (removed + replaced).
         let adSegmentCount: Int
+        /// Proxy path → absolute CDN URL for every segment and init-map URL
+        /// rewritten into `playlist`. Empty unless `variantBaseURL` was passed.
+        /// Guaranteed consistent with the playlist by construction — the
+        /// mapping is captured at the exact point each URL is rewritten.
+        let redirectMappings: [(path: String, url: URL)]
     }
 
     /// Cleans a variant playlist by detecting ad segments, then either removing
@@ -123,15 +133,20 @@ struct HLSPlaylistCleaner {
     ///     or `nil` to disable slate substitution (ad segments are removed instead).
     ///   - slateDuration: Duration of the slate segment in seconds — used for the
     ///     `#EXTINF` of replaced entries.
+    ///   - variantBaseURL: The final (post-redirect) URL the playlist was fetched
+    ///     from. When provided, `CleanResult.redirectMappings` maps each rewritten
+    ///     proxy path to its absolute CDN URL.
     /// - Returns: The cleaning result with rewritten playlist.
-    func cleanVariantPlaylist(_ m3u8: String, proxyBaseURL: String, segmentPathPrefix: String = "/seg", initPathPrefix: String = "/init", slatePathPrefix: String? = nil, slateDuration: Double = SlateSegment.duration) -> CleanResult {
+    func cleanVariantPlaylist(_ m3u8: String, proxyBaseURL: String, segmentPathPrefix: String = "/seg", initPathPrefix: String = "/init", slatePathPrefix: String? = nil, slateDuration: Double = SlateSegment.duration, variantBaseURL: URL? = nil) -> CleanResult {
         let lines = m3u8.components(separatedBy: .newlines)
+        // Trimmed once, shared by every detection/rewrite pass below.
+        let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
         // --- Phase 1: detect ad segments ---
 
-        let markedRemoved = detectMarkedAdSegments(lines: lines)
-        let urlRemoved = detectURLPatternAds(lines: lines)
-        let durationRemoved = detectDurationAnomalies(lines: lines)
+        let markedRemoved = detectMarkedAdSegments(trimmedLines: trimmedLines)
+        let urlRemoved = detectURLPatternAds(trimmedLines: trimmedLines)
+        let durationRemoved = detectDurationAnomalies(trimmedLines: trimmedLines)
 
         let adIndices = markedRemoved.union(urlRemoved).union(durationRemoved)
 
@@ -146,13 +161,13 @@ struct HLSPlaylistCleaner {
         // It is only safe for MPEG-TS live streams: an fMP4 playlist declares
         // `#EXT-X-MAP` init segments whose scope would cover the TS slate.
         let isVOD = m3u8.contains("#EXT-X-ENDLIST")
-        let hasInitMap = lines.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXT-X-MAP:") }
+        let hasInitMap = trimmedLines.contains { $0.hasPrefix("#EXT-X-MAP:") }
         let useSlate = slatePathPrefix != nil && !isVOD && !hasInitMap
 
         // Current MEDIA-SEQUENCE — used to keep slate placeholder URLs unique
         // across reloads (see slate path below).
-        let mediaSequence = lines
-            .first { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXT-X-MEDIA-SEQUENCE:") }
+        let mediaSequence = trimmedLines
+            .first { $0.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") }
             .flatMap { $0.components(separatedBy: ":").last }
             .flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
 
@@ -183,10 +198,7 @@ struct HLSPlaylistCleaner {
             // (AVPlayer sees the same empty playlist on every poll). Keep at least
             // one content segment to anchor playback, even if it means one ad
             // segment survives — better than the stream dying.
-            let totalSegments = lines.filter {
-                let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-                return !t.isEmpty && !t.hasPrefix("#")
-            }.count
+            let totalSegments = trimmedLines.filter { !$0.isEmpty && !$0.hasPrefix("#") }.count
             if totalSegments > 0, removedIndices.count == totalSegments {
                 if isVOD {
                     // Every single segment looks like an ad — the detection misfired.
@@ -205,6 +217,7 @@ struct HLSPlaylistCleaner {
 
         let rewritten = rewriteVariantLines(
             lines: lines,
+            trimmedLines: trimmedLines,
             removedIndices: removedIndices,
             replacedIndices: replacedIndices,
             proxyBaseURL: proxyBaseURL,
@@ -212,15 +225,17 @@ struct HLSPlaylistCleaner {
             initPathPrefix: initPathPrefix,
             slatePathPrefix: slatePathPrefix,
             slateDuration: slateDuration,
-            mediaSequence: mediaSequence
+            mediaSequence: mediaSequence,
+            variantBaseURL: variantBaseURL
         )
 
         return CleanResult(
-            playlist: rewritten,
+            playlist: rewritten.playlist,
             removedIndices: removedIndices,
             replacedIndices: replacedIndices,
             adReplaced: !removedIndices.isEmpty || !replacedIndices.isEmpty,
-            adSegmentCount: removedIndices.count + replacedIndices.count
+            adSegmentCount: removedIndices.count + replacedIndices.count,
+            redirectMappings: rewritten.redirectMappings
         )
     }
 
@@ -300,16 +315,14 @@ struct HLSPlaylistCleaner {
     /// is considered over even without an explicit end marker. Without this, a
     /// Twitch playlist that carries `SCTE35-OUT` but no `SCTE35-IN` in the same
     /// window would cause every following segment to be deleted.
-    private func detectMarkedAdSegments(lines: [String]) -> Set<Int> {
+    private func detectMarkedAdSegments(trimmedLines: [String]) -> Set<Int> {
         var removed = Set<Int>()
         var segmentIndex = 0
         var inAd = false
         var adBudget: Double = 0
         var pendingDuration: Double = 0
 
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-
+        for trimmed in trimmedLines {
             switch classifyAdTag(trimmed) {
             case .adStart(let duration):
                 inAd = true
@@ -346,19 +359,18 @@ struct HLSPlaylistCleaner {
     }
 
     /// Detects segments whose URLs match known ad CDN patterns.
-    private func detectURLPatternAds(lines: [String]) -> Set<Int> {
+    private func detectURLPatternAds(trimmedLines: [String]) -> Set<Int> {
         var removed = Set<Int>()
         var segmentIndex = 0
 
         // Kept deliberately specific — loose patterns ("-ad-", "a/video")
         // false-positive on content segment hashes and kill playback.
         let adPatterns = [
-            "amazon-ads", "/ads/", ".ads.", "ads.", "doubleclick",
+            "amazon-ads", "/ads/", "ads.", "doubleclick",
             "googlesyndication", "adserver", "stitched-ad", "/advertisement/",
         ]
 
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        for trimmed in trimmedLines {
             if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
 
             let lower = trimmed.lowercased()
@@ -377,13 +389,12 @@ struct HLSPlaylistCleaner {
     /// - Typical live content segments are ~2s (low-latency HLS)
     /// - Ad segments are typically 6s, 15s, 30s, or 60s
     /// - A run of anomalous-duration segments is flagged as an ad block
-    private func detectDurationAnomalies(lines: [String]) -> Set<Int> {
+    private func detectDurationAnomalies(trimmedLines: [String]) -> Set<Int> {
         var removed = Set<Int>()
 
         // Collect segment durations
         var durations: [Double] = []
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        for trimmed in trimmedLines {
             if trimmed.hasPrefix("#EXTINF:") {
                 durations.append(extinfDuration(trimmed))
             }
@@ -409,7 +420,7 @@ struct HLSPlaylistCleaner {
 
         // Known ad durations (within 0.5s tolerance).
         // 10s is excluded — it's the standard live segment duration on Twitch.
-        let adDurations: Set<Double> = [6, 15, 30, 60]
+        let adDurations = Self.knownAdDurations
 
         // Never flag segments whose duration matches the content mode
         let modeTolerance = max(0.5, mode * 0.1)
@@ -485,6 +496,7 @@ struct HLSPlaylistCleaner {
     /// them with slate placeholders), rewrites remaining URLs.
     private func rewriteVariantLines(
         lines: [String],
+        trimmedLines: [String],
         removedIndices: Set<Int>,
         replacedIndices: Set<Int>,
         proxyBaseURL: String,
@@ -492,9 +504,11 @@ struct HLSPlaylistCleaner {
         initPathPrefix: String,
         slatePathPrefix: String?,
         slateDuration: Double,
-        mediaSequence: Int?
-    ) -> String {
+        mediaSequence: Int?,
+        variantBaseURL: URL?
+    ) -> (playlist: String, redirectMappings: [(path: String, url: URL)]) {
         var result: [String] = []
+        var redirectMappings: [(path: String, url: URL)] = []
         var segmentIndex = 0
         var mapIndex = 0
         var pendingEXTINF: String?
@@ -506,14 +520,8 @@ struct HLSPlaylistCleaner {
         /// `#EXT-X-KEY:METHOD=NONE` and reopens it when content resumes.
         var activeKeyLine: String?
 
-        func appendDiscontinuityIfNeeded() {
-            if result.last?.trimmingCharacters(in: .whitespacesAndNewlines) != "#EXT-X-DISCONTINUITY" {
-                result.append("#EXT-X-DISCONTINUITY")
-            }
-        }
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        for (index, line) in lines.enumerated() {
+            let trimmed = trimmedLines[index]
 
             // Buffer #EXTINF — it is written only if its segment survives.
             if trimmed.hasPrefix("#EXTINF:") {
@@ -549,11 +557,16 @@ struct HLSPlaylistCleaner {
                     continue
                 }
                 if trimmed.hasPrefix("#EXT-X-MAP:URI=\"") {
+                    let filename = Self.segmentFilename(extractURI(from: trimmed) ?? "")
                     if let rewritten = rewritingURIAttribute(
                         of: line,
-                        to: "\(proxyBaseURL)\(initPathPrefix)/\(mapIndex)/\(Self.segmentFilename(extractURI(from: trimmed) ?? ""))"
+                        to: "\(proxyBaseURL)\(initPathPrefix)/\(mapIndex)/\(filename)"
                     ) {
                         result.append(rewritten)
+                        if let variantBaseURL, let uri = extractURI(from: trimmed),
+                           let absolute = URL(string: uri, relativeTo: variantBaseURL)?.absoluteURL {
+                            redirectMappings.append(("\(initPathPrefix)/\(mapIndex)/\(filename)", absolute))
+                        }
                         mapIndex += 1
                     } else {
                         result.append(line)
@@ -631,8 +644,11 @@ struct HLSPlaylistCleaner {
             // would read as "new" segments, while reused slate URLs read as
             // "already played". Filename-based URLs stay stable across reloads,
             // exactly like the CDN's own URLs.
-            let proxyURL = "\(proxyBaseURL)\(segmentPathPrefix)/\(Self.segmentFilename(trimmed))"
-            result.append(proxyURL)
+            let filename = Self.segmentFilename(trimmed)
+            result.append("\(proxyBaseURL)\(segmentPathPrefix)/\(filename)")
+            if let variantBaseURL, let absolute = URL(string: trimmed, relativeTo: variantBaseURL)?.absoluteURL {
+                redirectMappings.append(("\(segmentPathPrefix)/\(filename)", absolute))
+            }
             segmentIndex += 1
         }
 
@@ -642,14 +658,14 @@ struct HLSPlaylistCleaner {
         // is too close to live" (-16831) on short LL-HLS windows. -12888 is now
         // prevented structurally (never-empty playlists + per-poll variation), so
         // keeping the true value (2s on Twitch) is the safer trade-off.
-        return result.joined(separator: "\n")
+        return (result.joined(separator: "\n"), redirectMappings)
     }
 
     // MARK: - URI helpers
 
     /// Last path component of a URL string, without any query string.
-    /// Used for proxy paths — must stay consistent with the redirect cache keys
-    /// in `AdStrippingProxy` (a `?sig=…` suffix in the filename would 404).
+    /// Used for proxy paths and `CleanResult.redirectMappings` keys — a
+    /// `?sig=…` suffix in the filename would 404.
     static func segmentFilename(_ urlString: String) -> String {
         let noQuery = urlString.components(separatedBy: "?").first ?? urlString
         return noQuery.components(separatedBy: "/").last ?? noQuery

@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Network
 import Testing
 @testable import TSPlayerKit
 
@@ -205,6 +206,33 @@ struct FileStreamerTests {
         )
         #expect(data.isEmpty)
     }
+
+    @Test("Concurrent reads over one streamer return correct slices")
+    func concurrentReadsReturnCorrectSlices() async throws {
+        // Distinct byte values per position so any slice mix-up is caught.
+        var content = Data(count: 1_000_000)
+        for i in 0 ..< content.count { content[i] = UInt8(i % 251) }
+        let fileURL = try makeTempFile(content: content)
+        defer { removeTempFile(at: fileURL) }
+
+        let streamer = try FileStreamer(fileURL: fileURL)
+        let sliceSize = 100_000
+        await withTaskGroup(of: (Int, Data?).self) { group in
+            for i in 0 ..< 10 {
+                group.addTask {
+                    let data = try? await streamer.readBytes(
+                        offset: UInt64(i * sliceSize), length: UInt64(sliceSize)
+                    )
+                    return (i, data)
+                }
+            }
+            for await (i, data) in group {
+                guard let data else { Issue.record("read \(i) failed"); continue }
+                let expected = content.subdata(in: i * sliceSize ..< (i + 1) * sliceSize)
+                #expect(data == expected, "slice \(i) mismatched")
+            }
+        }
+    }
 }
 
 // MARK: - LocalHTTPServer Tests
@@ -316,6 +344,117 @@ struct LocalHTTPServerTests {
         let httpResponse = response as! HTTPURLResponse
 
         #expect(httpResponse.statusCode == 404)
+    }
+
+    // MARK: Range hardening
+
+    private func rangeRequest(port: UInt16, path: String, range: String) async throws -> (Data, HTTPURLResponse) {
+        let url = URL(string: "http://127.0.0.1:\(port)\(path)")!
+        var request = URLRequest(url: url)
+        request.setValue(range, forHTTPHeaderField: "Range")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        return (data, response as! HTTPURLResponse)
+    }
+
+    @Test("Inverted range (bytes=100-50) returns 416, no crash")
+    func invertedRangeReturns416() async throws {
+        var content = Data(count: 256)
+        for i in 0 ..< 256 { content[i] = UInt8(i) }
+        let fileURL = try makeTempFile(content: content)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let server = try LocalHTTPServer(streamer: try FileStreamer(fileURL: fileURL))
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        let (_, response) = try await rangeRequest(port: server.port, path: "/segment.ts", range: "bytes=100-50")
+        #expect(response.statusCode == 416)
+        #expect(response.allHeaderFields["Content-Range"] as? String == "bytes */256")
+
+        // The server is still alive after the malformed request.
+        let (data, ok) = try await rangeRequest(port: server.port, path: "/segment.ts", range: "bytes=0-9")
+        #expect(ok.statusCode == 206)
+        #expect(data.count == 10)
+    }
+
+    @Test("Range starting past EOF returns 416, no underflow")
+    func rangePastEndReturns416() async throws {
+        let content = Data(repeating: 0x47, count: 256)
+        let fileURL = try makeTempFile(content: content)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let server = try LocalHTTPServer(streamer: try FileStreamer(fileURL: fileURL))
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        let (_, response) = try await rangeRequest(port: server.port, path: "/segment.ts", range: "bytes=99999999-")
+        #expect(response.statusCode == 416)
+
+        let (_, closed) = try await rangeRequest(port: server.port, path: "/segment.ts", range: "bytes=300-400")
+        #expect(closed.statusCode == 416)
+    }
+
+    @Test("Suffix range (bytes=-N) returns the LAST N bytes")
+    func suffixRangeReturnsLastBytes() async throws {
+        var content = Data(count: 256)
+        for i in 0 ..< 256 { content[i] = UInt8(i) }
+        let fileURL = try makeTempFile(content: content)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let server = try LocalHTTPServer(streamer: try FileStreamer(fileURL: fileURL))
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        let (data, response) = try await rangeRequest(port: server.port, path: "/segment.ts", range: "bytes=-50")
+        #expect(response.statusCode == 206)
+        #expect(response.allHeaderFields["Content-Range"] as? String == "bytes 206-255/256")
+        #expect(data.count == 50)
+        for i in 0 ..< 50 {
+            #expect(data[i] == UInt8(206 + i))
+        }
+    }
+
+    @Test("Malformed range specs return 416 (multipart, garbage, double dash)")
+    func malformedRangesReturn416() async throws {
+        let content = Data(repeating: 0x47, count: 256)
+        let fileURL = try makeTempFile(content: content)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let server = try LocalHTTPServer(streamer: try FileStreamer(fileURL: fileURL))
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        for spec in ["bytes=0-10,20-30", "bytes=abc-def", "bytes=1-2-3", "bytes=-"] {
+            let (_, response) = try await rangeRequest(port: server.port, path: "/segment.ts", range: spec)
+            #expect(response.statusCode == 416, "spec \(spec) should be 416")
+        }
+    }
+
+    @Test("Range handling is identical in multi-segment mode")
+    func multiSegmentRangeHardening() async throws {
+        var seg = Data(count: 200)
+        for i in 0 ..< 200 { seg[i] = UInt8(i % 256) }
+        let fileURL = try makeTempFile(content: seg)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let segments = [SegmentInfo(offset: 0, duration: 2.0, length: 200)]
+        let server = try LocalHTTPServer(streamer: try FileStreamer(fileURL: fileURL), segments: segments)
+        defer { server.stop() }
+        server.setManifest(Data())
+
+        // Inverted → 416
+        let (_, inverted) = try await rangeRequest(port: server.port, path: "/segment_0.ts", range: "bytes=100-50")
+        #expect(inverted.statusCode == 416)
+
+        // Suffix → last 40 bytes of the segment
+        let (suffixData, suffix) = try await rangeRequest(port: server.port, path: "/segment_0.ts", range: "bytes=-40")
+        #expect(suffix.statusCode == 206)
+        #expect(suffix.allHeaderFields["Content-Range"] as? String == "bytes 160-199/200")
+        #expect(suffixData == seg.subdata(in: 160 ..< 200))
+
+        // Open range past segment end → 416
+        let (_, past) = try await rangeRequest(port: server.port, path: "/segment_0.ts", range: "bytes=500-")
+        #expect(past.statusCode == 416)
     }
 
     // MARK: Multi-segment TS mode
@@ -476,6 +615,52 @@ struct LocalHTTPServerTests {
         let url = URL(string: "http://127.0.0.1:\(server.port)/playlist.m3u8")!
         let (_, response) = try await URLSession.shared.data(from: url)
         #expect((response as! HTTPURLResponse).statusCode == 404)
+    }
+
+    @Test("Directory mode rejects path traversal outside the served root")
+    func directoryModeRejectsPathTraversal() async throws {
+        let dirURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fmp4_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+
+        // A file OUTSIDE the served directory, reachable via `../`.
+        let secretURL = dirURL.deletingLastPathComponent()
+            .appendingPathComponent("secret_\(UUID().uuidString).txt")
+        try "topsecret".write(to: secretURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: secretURL) }
+
+        let server = try LocalHTTPServer(directoryURL: dirURL)
+        defer { server.stop() }
+
+        // Percent-encoded so the client's URL layer does not normalize `..` away.
+        let url = URL(string: "http://127.0.0.1:\(server.port)/%2e%2e%2f\(secretURL.lastPathComponent)")!
+        let (data, response) = try await URLSession.shared.data(from: url)
+        let httpResponse = response as! HTTPURLResponse
+        #expect(httpResponse.statusCode == 403)
+        #expect(String(data: data, encoding: .utf8) != "topsecret")
+    }
+
+    @Test("Directory mode serves fMP4 segments as video/mp4")
+    func directoryModeContentTypes() async throws {
+        let dirURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fmp4_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+
+        try Data(repeating: 0xAB, count: 64).write(to: dirURL.appendingPathComponent("seg_0.m4s"))
+        try Data(repeating: 0x47, count: 188).write(to: dirURL.appendingPathComponent("seg_1.ts"))
+
+        let server = try LocalHTTPServer(directoryURL: dirURL)
+        defer { server.stop() }
+
+        let m4sURL = URL(string: "http://127.0.0.1:\(server.port)/seg_0.m4s")!
+        let (_, m4sResponse) = try await URLSession.shared.data(from: m4sURL)
+        #expect((m4sResponse as! HTTPURLResponse).allHeaderFields["Content-Type"] as? String == "video/mp4")
+
+        let tsURL = URL(string: "http://127.0.0.1:\(server.port)/seg_1.ts")!
+        let (_, tsResponse) = try await URLSession.shared.data(from: tsURL)
+        #expect((tsResponse as! HTTPURLResponse).allHeaderFields["Content-Type"] as? String == "video/mp2t")
     }
 }
 
@@ -1153,6 +1338,43 @@ struct HLSPlaylistCleanerTests {
         // KEY URI is NOT rewritten — AVPlayer fetches it directly.
         #expect(result.playlist.contains("URI=\"https://cdn.example.com/key.bin\""))
     }
+
+    @Test("redirectMappings stay consistent with rewritten proxy paths")
+    func redirectMappingsMatchProxyPaths() {
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MAP:URI="init.mp4"
+        #EXTINF:2.000,
+        seg0.ts?token=abc
+        #EXTINF:2.000,
+        seg1.ts
+        #EXT-X-ENDLIST
+        """
+        let baseURL = URL(string: "https://cdn.example.com/live/stream/index.m3u8")!
+
+        let result = cleaner.cleanVariantPlaylist(
+            variant,
+            proxyBaseURL: "http://127.0.0.1:9999",
+            segmentPathPrefix: "/seg/0",
+            initPathPrefix: "/init/0",
+            variantBaseURL: baseURL
+        )
+
+        let mappings = Dictionary(result.redirectMappings.map { ($0.path, $0.url) },
+                                  uniquingKeysWith: { first, _ in first })
+        // Every rewritten path appears in the playlist, and every URL is
+        // resolved against the variant's post-redirect base URL.
+        for (path, url) in result.redirectMappings {
+            #expect(result.playlist.contains(path), "playlist lacks rewritten path \(path)")
+            #expect(url.absoluteString.hasPrefix("https://cdn.example.com/live/stream/"))
+        }
+        // Query strings are stripped from the proxy path (they would 404) but
+        // preserved in the forwarded CDN URL.
+        #expect(mappings["/seg/0/seg0.ts"]?.absoluteString == "https://cdn.example.com/live/stream/seg0.ts?token=abc")
+        #expect(mappings["/seg/0/seg1.ts"]?.absoluteString == "https://cdn.example.com/live/stream/seg1.ts")
+        #expect(mappings["/init/0/0/init.mp4"]?.absoluteString == "https://cdn.example.com/live/stream/init.mp4")
+    }
 }
 
 // MARK: - Slate substitution Tests
@@ -1543,6 +1765,253 @@ struct AdStrippingProxyTests {
         let (segData, segResp) = try await URLSession.shared.data(from: URL(string: "\(base)/seg/0/seg100.ts")!)
         #expect((segResp as! HTTPURLResponse).statusCode == 200)
         #expect(segData == contentBytes)
+    }
+}
+
+// MARK: - Programmable static origin
+
+/// Minimal HTTP origin for fetcher/proxy tests: fixed responses per path,
+/// request counting, and optional first-request connection drops.
+final class StaticOriginServer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "test.staticorigin")
+    private let readySemaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private(set) var port: UInt16 = 0
+
+    /// (status, contentType, body) per path. Unlisted paths → 404.
+    private let responses: [String: (Int, String, Data)]
+    /// Paths whose FIRST request is answered by dropping the connection
+    /// without a response — simulates a transport-level failure.
+    private let dropFirstFor: Set<String>
+    private var requestCounts: [String: Int] = [:]
+    private var requestHeads: [String: String] = [:]
+
+    init(responses: [String: (Int, String, Data)], dropFirstFor: Set<String> = []) throws {
+        self.responses = responses
+        self.dropFirstFor = dropFirstFor
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: params)
+        self.listener = listener
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .ready = state {
+                self.port = listener.port?.rawValue ?? 0
+                self.readySemaphore.signal()
+            }
+        }
+        listener.newConnectionHandler = { [weak self] conn in self?.handle(conn) }
+        listener.start(queue: queue)
+        readySemaphore.wait()
+    }
+
+    var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
+    func stop() { listener.cancel() }
+
+    func requestCount(for path: String) -> Int {
+        lock.withLock { requestCounts[path] ?? 0 }
+    }
+
+    /// Raw request head (request line + headers) of the LAST request for a path.
+    func lastRequestHead(for path: String) -> String? {
+        lock.withLock { requestHeads[path] }
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        receiveHead(connection, accumulated: Data())
+    }
+
+    private func receiveHead(_ connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            guard error == nil, let data else { connection.cancel(); return }
+            var buffer = accumulated
+            buffer.append(data)
+            if buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) != nil {
+                self.route(head: buffer, on: connection)
+            } else if isComplete || buffer.count > 64 * 1024 {
+                connection.cancel()
+            } else {
+                self.receiveHead(connection, accumulated: buffer)
+            }
+        }
+    }
+
+    private func route(head: Data, on connection: NWConnection) {
+        let raw = String(data: head, encoding: .utf8) ?? ""
+        let requestLine = raw.components(separatedBy: "\r\n").first ?? ""
+        let target = requestLine.components(separatedBy: " ").dropFirst().first ?? ""
+        let path = target.components(separatedBy: "?").first ?? target
+
+        lock.withLock {
+            requestCounts[path, default: 0] += 1
+            requestHeads[path] = raw
+        }
+
+        if requestCount(for: path) == 1, dropFirstFor.contains(path) {
+            // Transport-level failure: close without answering.
+            connection.cancel()
+            return
+        }
+
+        let (status, contentType, body) = responses[path] ?? (404, "text/plain", Data())
+        let headText = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\n"
+            + "Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        var out = Data(headText.utf8)
+        out.append(body)
+        connection.send(content: out, completion: .contentProcessed { _ in connection.cancel() })
+    }
+}
+
+// MARK: - RemotePlaylistFetcher Tests
+
+@Suite("RemotePlaylistFetcher")
+struct RemotePlaylistFetcherTests {
+
+    private func makeFetcher(extraHeaders: [String: String] = [:]) -> RemotePlaylistFetcher {
+        RemotePlaylistFetcher(userAgent: "FetcherTests", extraHeaders: extraHeaders, timeout: 2)
+    }
+
+    @Test("HTTP 200 with HTML body is rejected as invalidPlaylist")
+    func htmlPageIsRejected() async throws {
+        let origin = try StaticOriginServer(responses: [
+            "/playlist.m3u8": (200, "text/html", Data("<html><body>gateway error</body></html>".utf8)),
+        ])
+        defer { origin.stop() }
+        let fetcher = makeFetcher()
+
+        do {
+            _ = try await fetcher.fetchPlaylist(url: origin.baseURL.appendingPathComponent("playlist.m3u8"))
+            Issue.record("expected invalidPlaylist, got a result")
+        } catch RemotePlaylistFetcher.FetchError.invalidPlaylist {
+            // expected
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test("HTTP 403 fails immediately without retry")
+    func httpErrorFailsImmediately() async throws {
+        let origin = try StaticOriginServer(responses: [
+            "/playlist.m3u8": (403, "text/plain", Data("denied".utf8)),
+        ])
+        defer { origin.stop() }
+        let fetcher = makeFetcher()
+
+        do {
+            _ = try await fetcher.fetchPlaylist(url: origin.baseURL.appendingPathComponent("playlist.m3u8"))
+            Issue.record("expected httpError, got a result")
+        } catch let error as RemotePlaylistFetcher.FetchError {
+            guard case .httpError(let code) = error else {
+                Issue.record("expected httpError, got \(error)")
+                return
+            }
+            #expect(code == 403)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+        #expect(origin.requestCount(for: "/playlist.m3u8") == 1)
+    }
+
+    @Test("Transport-level failure gets exactly one retry")
+    func transportFailureGetsSingleRetry() async throws {
+        // The first request is dropped without a response; the retry succeeds.
+        let valid = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.000,
+        seg0.ts
+        #EXT-X-ENDLIST
+        """
+        let origin = try StaticOriginServer(
+            responses: ["/playlist.m3u8": (200, "application/vnd.apple.mpegurl", Data(valid.utf8))],
+            dropFirstFor: ["/playlist.m3u8"]
+        )
+        defer { origin.stop() }
+        let fetcher = makeFetcher()
+
+        let (text, _) = try await fetcher.fetchPlaylist(url: origin.baseURL.appendingPathComponent("playlist.m3u8"))
+        #expect(text.hasPrefix("#EXTM3U"))
+        #expect(origin.requestCount(for: "/playlist.m3u8") == 2)
+    }
+
+    @Test("User-Agent and extra headers reach the origin")
+    func extraHeadersAreSent() async throws {
+        let origin = try StaticOriginServer(responses: [
+            "/playlist.m3u8": (200, "application/vnd.apple.mpegurl", Data("#EXTM3U\n".utf8)),
+        ])
+        defer { origin.stop() }
+        let fetcher = makeFetcher(extraHeaders: ["X-Client-Id": "abc123"])
+
+        _ = try? await fetcher.fetchPlaylist(url: origin.baseURL.appendingPathComponent("playlist.m3u8"))
+        let head = origin.lastRequestHead(for: "/playlist.m3u8") ?? ""
+        #expect(head.contains("User-Agent: FetcherTests"))
+        #expect(head.contains("X-Client-Id: abc123"))
+    }
+}
+
+// MARK: - AdStrippingProxy failure paths Tests
+
+@Suite("AdStrippingProxyFailures")
+struct AdStrippingProxyFailureTests {
+
+    @Test("Segment CDN error (403) is answered with a clean 502")
+    func segmentErrorBecomes502() async throws {
+        let master = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=10000000
+        /variant/0.m3u8
+        """
+        let variant = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MEDIA-SEQUENCE:0
+        #EXTINF:2.000,
+        seg0.ts
+        #EXT-X-ENDLIST
+        """
+        // The origin 403s the segment with an HTML body — the proxy must
+        // answer 502 and never stream that body to AVPlayer as video/mp2t.
+        let origin = try StaticOriginServer(responses: [
+            "/playlist.m3u8": (200, "application/vnd.apple.mpegurl", Data(master.utf8)),
+            "/variant/0.m3u8": (200, "application/vnd.apple.mpegurl", Data(variant.utf8)),
+            "/seg0.ts": (403, "text/html", Data("<html>denied</html>".utf8)),
+        ])
+        defer { origin.stop() }
+
+        let fetcher = RemotePlaylistFetcher(userAgent: "ProxyFailureTests", timeout: 2)
+        let proxy = try AdStrippingProxy(remoteURL: origin.baseURL.appendingPathComponent("playlist.m3u8"), fetcher: fetcher)
+        defer { proxy.stop() }
+
+        // Walk the local playlist chain first — the segment mapping is only
+        // registered once the variant has been fetched through the proxy.
+        let base = "http://127.0.0.1:\(proxy.localURL.port!)"
+        let (_, masterResp) = try await URLSession.shared.data(from: URL(string: "\(base)/master.m3u8")!)
+        #expect((masterResp as! HTTPURLResponse).statusCode == 200)
+        let (_, variantResp) = try await URLSession.shared.data(from: URL(string: "\(base)/variant/0.m3u8")!)
+        #expect((variantResp as! HTTPURLResponse).statusCode == 200)
+
+        let (data, segResp) = try await URLSession.shared.data(from: URL(string: "\(base)/seg/0/seg0.ts")!)
+        #expect((segResp as! HTTPURLResponse).statusCode == 502)
+        #expect(!String(data: data, encoding: .utf8)!.contains("denied"))
+    }
+
+    @Test("Invalid origin playlist becomes a clean 502")
+    func invalidPlaylistBecomes502() async throws {
+        let origin = try StaticOriginServer(responses: [
+            "/playlist.m3u8": (200, "text/html", Data("<html>gateway error page</html>".utf8)),
+        ])
+        defer { origin.stop() }
+
+        let fetcher = RemotePlaylistFetcher(userAgent: "ProxyFailureTests", timeout: 2)
+        let proxy = try AdStrippingProxy(remoteURL: origin.baseURL.appendingPathComponent("playlist.m3u8"), fetcher: fetcher)
+        defer { proxy.stop() }
+
+        let (data, resp) = try await URLSession.shared.data(from: proxy.localURL)
+        #expect((resp as! HTTPURLResponse).statusCode == 502)
+        #expect(!String(data: data, encoding: .utf8)!.contains("gateway error page"))
     }
 }
 

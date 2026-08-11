@@ -174,18 +174,37 @@ func downloadAndPlay(from remoteURL: URL) async throws {
 Point d'entrée principal. Wrapper qui produit un `AVPlayerItem` configuré pour la lecture d'un fichier `.ts`.
 
 ```swift
-public struct TSPlayerItem {
+public final class TSPlayerItem {
     /// L'AVPlayerItem prêt à être lu par AVPlayer.
     public let playerItem: AVPlayerItem
 
     /// Crée un player item pour un fichier .ts local.
     /// - Parameters:
     ///   - tsFileURL: L'URL locale du fichier .ts
-    ///   - targetDuration: Durée déclarée dans le manifeste HLS (secondes, défaut: 10)
-    /// - Throws: FileStreamerError si le fichier est inaccessible
-    public init(tsFileURL: URL, targetDuration: Double = 10.0) throws
+    ///   - totalDuration: Durée totale déclarée dans le manifeste HLS (secondes)
+    /// - Throws: TSPlayerItemError si les segments sont invalides
+    public init(tsFileURL: URL, totalDuration: Double) throws
+
+    /// Mode multi-segments (concatenated TS) : tous les segments dans un seul fichier.
+    public init(tsFileURL: URL, segments: [SegmentInfo]) throws
+
+    /// Mode multi-fichiers : les segments répartis dans plusieurs fichiers .ts
+    /// (champ `file` de `SegmentInfo`).
+    public init(tsFilesDirectory: URL, segments: [SegmentInfo]) throws
+
+    /// Mode fMP4 : sert un répertoire de fichiers (`index.m3u8` + segments/init).
+    public init(fmp4Directory: URL) throws
 }
 ```
+
+### `TSPlayerItemError`
+
+Erreurs lancées par les initialiseurs de `TSPlayerItem` (public depuis 1.2.0).
+
+| Cas | Description |
+|---|---|
+| `.emptySegments` | Le tableau `segments` est vide |
+| `.missingFileField` | Un segment multi-fichiers a un champ `file` à `nil` |
 
 ### `FileStreamerError`
 
@@ -232,9 +251,9 @@ Sources/TSPlayerKit/
 
 | Plateforme | Version minimum |
 |---|---|
-| macOS | 10.15+ |
-| iOS | 13.0+ (compatible iOS 17+) |
-| tvOS | 13.0+ |
+| macOS | 12.0+ |
+| iOS | 15.0+ (compatible iOS 17+) |
+| tvOS | 15.0+ |
 | visionOS | 1.0+ |
 | Swift | 6.3+ |
 | Frameworks | `AVFoundation`, `Foundation`, `Network` |
@@ -280,7 +299,6 @@ Le slate est servi localement sur `/slate/{index}.ts` (aucun aller-retour résea
 
 ## Limitations
 
-- **Un seul segment** — La playlist ne déclare qu'un seul segment TS. Pour des vidéos multi-segments, le manifeste devrait être enrichi.
 - **Pas de chiffrement** — Les fichiers doivent être en clair (pas de FairPlay DRM).
 - **Performances disque** — `FileHandle` lit de manière synchrone sur une queue dédiée. Pour des fichiers très volumineux (>10 Go), le seek peut introduire une latence perceptible.
 - **Codecs supportés** — Dépend des capacités d'`AVFoundation` sur l'appareil. Les codecs non supportés par la plateforme ne seront pas lus.

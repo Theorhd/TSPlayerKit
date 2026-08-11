@@ -5,6 +5,7 @@ enum HLSManifestGenerator {
     private static let manifestPath = "playlist.m3u8"
 
     static func manifestURL(port: UInt16) -> URL {
+        // Loopback host and a valid UInt16 port always form a valid URL.
         URL(string: "http://\(host):\(port)/\(manifestPath)")!
     }
 
@@ -28,6 +29,7 @@ enum HLSManifestGenerator {
     }
 
     static func segmentURL(port: UInt16, index: Int) -> URL {
+        // Loopback host and a valid UInt16 port always form a valid URL.
         URL(string: "http://\(host):\(port)/segment_\(index).ts")!
     }
 

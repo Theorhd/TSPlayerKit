@@ -26,9 +26,14 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
     /// The local URL AVPlayer should use: `http://127.0.0.1:{port}/master.m3u8`
     public var localURL: URL {
+        // Loopback host and a valid UInt16 port always form a valid URL.
         URL(string: "http://127.0.0.1:\(port)/master.m3u8")!
     }
-    public var segmentMode: SegmentMode = .stream
+    /// How segments are served. Read/written under `stateLock`.
+    public var segmentMode: SegmentMode {
+        get { stateLock.withLock { _segmentMode } }
+        set { stateLock.withLock { _segmentMode = newValue } }
+    }
 
     /// Creates and starts the proxy server.
     public init(remoteURL: URL, fetcher: RemotePlaylistFetcher) throws {
@@ -39,7 +44,20 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
     deinit { stop() }
 
-    public func stop() { listener?.cancel(); listener = nil }
+    public func stop() {
+        listener?.cancel()
+        listener = nil
+        // NWListener.cancel() does NOT cancel already-accepted connections:
+        // close them all, and cancel the CDN downloads still feeding them.
+        let (connections, streams) = stateLock.withLock { () -> ([NWConnection], [RemotePlaylistFetcher.SegmentStreamHandle]) in
+            let c = Array(activeConnections.values), s = Array(activeStreams.values)
+            activeConnections.removeAll()
+            activeStreams.removeAll()
+            return (c, s)
+        }
+        for connection in connections { connection.cancel() }
+        for stream in streams { stream.cancel() }
+    }
 
     // MARK: - Private state
 
@@ -55,6 +73,13 @@ public final class AdStrippingProxy: @unchecked Sendable {
     private var segmentRedirects: [String: URL] = [:]
     private let stateLock = NSLock()
     private var isSingleVariant: Bool = false
+    private var _segmentMode: SegmentMode = .stream
+
+    /// Accepted connections and their in-flight segment downloads — tracked so
+    /// `stop()` can actually close them (NWListener.cancel() does not) and so a
+    /// dead client connection cancels the CDN download feeding it.
+    private var activeConnections: [ObjectIdentifier: NWConnection] = [:]
+    private var activeStreams: [ObjectIdentifier: RemotePlaylistFetcher.SegmentStreamHandle] = [:]
 
     /// Tracks the hash of the last *cleaned* playlist served per variant index.
     /// When a poll returns the same content, we append a unique comment so
@@ -62,6 +87,12 @@ public final class AdStrippingProxy: @unchecked Sendable {
     /// detection fires after 1.5 × TARGETDURATION and aborts with -12888.
     private var lastCleanedPlaylistHash: [Int: Int] = [:]
     private var playlistSeq: [Int: Int] = [:]
+
+    /// Bandwidth hint for the synthetic master playlist of single-variant streams.
+    private static let syntheticMasterBandwidth = 10_000_000
+
+    /// Upper bound of the rewritten-slate cache: a couple of breaks' worth.
+    private static let slateCacheLimit = 128
 
     private var isSingleVariantLocked: Bool {
         get { stateLock.withLock { isSingleVariant } }
@@ -72,17 +103,15 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
     private func start() throws {
         let params = NWParameters.tcp
-        // Enable TCP_NODELAY — our responses are small and latency matters.
         params.allowLocalEndpointReuse = true
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
         // Keep connections alive briefly in case AVPlayer sends pipelined requests
         // (it doesn't, but the setting is harmless).
         params.allowFastOpen = true
 
-        let listener: NWListener
-        do { listener = try NWListener(using: params) }
-        catch { throw error }
+        let listener = try NWListener(using: params)
 
+        let failure = HTTPServerCommon.FailureBox()
         listener.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
@@ -91,9 +120,10 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 self.readySemaphore.signal()
             case .failed(let err):
                 print("🛡 AdStrippingProxy: NWListener failed — \(err.localizedDescription)")
+                failure.set(err)
                 self.readySemaphore.signal()
             case .cancelled:
-                print("🛡 AdStrippingProxy: NWListener cancelled")
+                break
             default: break
             }
         }
@@ -101,27 +131,17 @@ public final class AdStrippingProxy: @unchecked Sendable {
         listener.start(queue: serverQueue)
         self.listener = listener
         readySemaphore.wait()
+        if let error = failure.get() {
+            listener.cancel()
+            self.listener = nil
+            throw error
+        }
     }
 
     // MARK: - Connection handling
 
-    /// Simple armed/disarmed flag so the receive callback can cancel the idle
-    /// watchdog without capturing a non-Sendable `DispatchWorkItem`.
-    private final class IdleWatchdog: @unchecked Sendable {
-        private let lock = NSLock()
-        private var armed = true
-
-        func disarm() {
-            lock.lock(); armed = false; lock.unlock()
-        }
-
-        func isArmed() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            return armed
-        }
-    }
-
     private func handleConnection(_ connection: NWConnection) {
+        stateLock.withLock { _ = activeConnections[ObjectIdentifier(connection)] = connection }
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
@@ -134,9 +154,9 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 if code != 54 && code != 57 {
                     print("🛡 AdStrippingProxy: connection failed — \(error.localizedDescription)")
                 }
-                connection.cancel()
+                self.teardownConnection(connection)
             case .cancelled:
-                break
+                self.teardownConnection(connection)
             default:
                 break
             }
@@ -144,50 +164,46 @@ public final class AdStrippingProxy: @unchecked Sendable {
         connection.start(queue: serverQueue)
     }
 
-    private func receiveRequest(from connection: NWConnection, accumulated: Data = Data()) {
-        // AVPlayer occasionally opens a connection without sending anything
-        // (reachability probe). Drop it after 10 s instead of letting the stack
-        // hold it until its own timeout.
-        let watchdog = IdleWatchdog()
-        serverQueue.asyncAfter(deadline: .now() + 10) { [weak connection, weak watchdog] in
-            guard let watchdog, watchdog.isArmed() else { return }
-            connection?.cancel()
+    /// A connection is done (failed or cancelled): forget it and cancel the
+    /// segment download still feeding it, if any, so CDN bandwidth is not
+    /// wasted on a client that went away.
+    private func teardownConnection(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        let stream = stateLock.withLock { () -> RemotePlaylistFetcher.SegmentStreamHandle? in
+            activeConnections.removeValue(forKey: key)
+            return activeStreams.removeValue(forKey: key)
         }
+        stream?.cancel()
+        connection.cancel()
+    }
 
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self, weak watchdog] data, _, isComplete, error in
-            watchdog?.disarm()
-            guard let self else { return }
-            if let error {
+    private func receiveRequest(from connection: NWConnection) {
+        HTTPServerCommon.receiveRequest(
+            on: connection,
+            queue: serverQueue,
+            idleTimeout: HTTPServerCommon.idleConnectionTimeout,
+            maxHeadSize: HTTPServerCommon.maxRequestHeadSize,
+            onHead: { [weak self] head in self?.processRequest(headers: head, on: connection) },
+            onOversize: { HTTPServerCommon.sendQuick(431, on: connection) },
+            onError: { error in
                 // Expected teardown errors: ECONNRESET (54) = client hung up,
                 // ENOTCONN (57) = timing race with cancellation.
                 let code = (error as NSError).code
                 if code != 54 && code != 57 {
                     print("🛡 AdStrippingProxy: receive error — \(error.localizedDescription)")
                 }
-                connection.cancel()
-                return
             }
-            var buffer = accumulated
-            if let data { buffer.append(data) }
-            if buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) != nil {
-                self.processRequest(headers: buffer, on: connection)
-            } else if isComplete {
-                connection.cancel()
-            } else {
-                self.receiveRequest(from: connection, accumulated: buffer)
-            }
-        }
+        )
     }
 
     private func processRequest(headers: Data, on connection: NWConnection) {
-        guard let raw = String(data: headers, encoding: .utf8),
-              let requestLine = raw.components(separatedBy: "\r\n").first,
-              let rawPath = requestLine.components(separatedBy: " ").dropFirst().first
-        else { sendQuick(400, on: connection); return }
+        guard let head = HTTPServerCommon.parseHead(headers),
+              let rawPath = HTTPServerCommon.requestPath(from: head.line)
+        else { HTTPServerCommon.sendQuick(400, on: connection); return }
 
         // Strip query string — AVPlayer appends ?av=1, ?session=..., etc.
         let path = rawPath.components(separatedBy: "?").first ?? rawPath
-        let rangeHeader = extractHeader("Range", from: raw)
+        let rangeHeader = HTTPServerCommon.headerValue("Range", in: head.raw)
 
         switch path {
         case "/master.m3u8":
@@ -201,14 +217,15 @@ public final class AdStrippingProxy: @unchecked Sendable {
         case let p where p.hasPrefix("/slate/"):
             serveSlate(path: p, on: connection)
         default:
-            sendQuick(404, on: connection)
+            HTTPServerCommon.sendQuick(404, on: connection)
         }
     }
 
     // MARK: - Route handlers
 
     private func serveMaster(on connection: NWConnection) {
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             do {
                 let (text, finalURL) = try await fetcher.fetchPlaylist(url: remoteURL)
 
@@ -216,9 +233,13 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 if !text.contains("#EXT-X-STREAM-INF:") {
                     isSingleVariantLocked = true
                     stateLock.withLock { variantURLs = [finalURL] }
+                    // Single-variant streams get a synthetic master: AVPlayer
+                    // reads the variant through the same /variant/0 path as
+                    // multi-quality masters. The bandwidth value only hints at
+                    // the top bitrate — any plausible number works.
                     let fakeMaster = """
                     #EXTM3U
-                    #EXT-X-STREAM-INF:BANDWIDTH=10000000
+                    #EXT-X-STREAM-INF:BANDWIDTH=\(Self.syntheticMasterBandwidth)
                     http://127.0.0.1:\(port)/variant/0.m3u8
                     """
                     serveManifest(text: fakeMaster, on: connection)
@@ -235,7 +256,8 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 stateLock.withLock { variantURLs = resolved }
                 serveManifest(text: rewritten, on: connection)
             } catch {
-                sendQuick(502, on: connection)
+                print("🛡 AdStrippingProxy: master playlist fetch failed — \(error.localizedDescription)")
+                HTTPServerCommon.sendQuick(502, on: connection)
             }
         }
     }
@@ -244,18 +266,21 @@ public final class AdStrippingProxy: @unchecked Sendable {
         guard let idxStr = path.components(separatedBy: "/").last?
             .replacingOccurrences(of: ".m3u8", with: ""),
               let idx = Int(idxStr) else {
-            sendQuick(404, on: connection)
+            HTTPServerCommon.sendQuick(404, on: connection)
             return
         }
 
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             do {
                 let variantURL: URL
                 if isSingleVariantLocked {
-                    variantURL = remoteURL
+                    // serveMaster stored the post-redirect URL — reuse it
+                    // instead of re-following redirects on every poll.
+                    variantURL = stateLock.withLock { variantURLs.first } ?? remoteURL
                 } else {
                     let urls = stateLock.withLock { variantURLs }
-                    guard idx < urls.count else { sendQuick(404, on: connection); return }
+                    guard idx < urls.count else { HTTPServerCommon.sendQuick(404, on: connection); return }
                     variantURL = urls[idx]
                 }
 
@@ -267,10 +292,11 @@ public final class AdStrippingProxy: @unchecked Sendable {
                     initPathPrefix: "/init/\(idx)",
                     // Live ad breaks are filled with the local slate placeholder so
                     // the playlist never stalls (CoreMedia -12888). `nil` → removal.
-                    slatePathPrefix: SlateSegment.isAvailable ? "/slate" : nil
+                    slatePathPrefix: SlateSegment.isAvailable ? "/slate" : nil,
+                    variantBaseURL: variantFinalURL
                 )
 
-                cacheRedirectMappings(from: text, variantBaseURL: variantFinalURL, variantIdx: idx)
+                storeRedirectMappings(result.redirectMappings, variantIdx: idx)
                 if result.adSegmentCount > 0 {
                     let how = result.replacedIndices.isEmpty ? "stripped" : "replaced with slate"
                     print("🛡 AdStrippingProxy: \(how) \(result.adSegmentCount) ad segment(s) on variant \(idx)")
@@ -298,16 +324,17 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 }
                 serveManifest(text: finalPlaylist, on: connection)
             } catch {
-                sendQuick(502, on: connection)
+                print("🛡 AdStrippingProxy: variant \(idx) playlist fetch failed — \(error.localizedDescription)")
+                HTTPServerCommon.sendQuick(502, on: connection)
             }
         }
     }
 
     private func serveSegment(path: String, rangeHeader: String?, on connection: NWConnection) {
-        let (redirectURL, mode) = stateLock.withLock { (segmentRedirects[path], segmentMode) }
+        let (redirectURL, mode) = stateLock.withLock { (segmentRedirects[path], _segmentMode) }
 
         guard let realURL = redirectURL else {
-            sendQuick(404, on: connection)
+            HTTPServerCommon.sendQuick(404, on: connection)
             return
         }
 
@@ -320,10 +347,10 @@ public final class AdStrippingProxy: @unchecked Sendable {
     }
 
     private func serveInit(path: String, on connection: NWConnection) {
-        let (redirectURL, mode) = stateLock.withLock { (segmentRedirects[path], segmentMode) }
+        let (redirectURL, mode) = stateLock.withLock { (segmentRedirects[path], _segmentMode) }
 
         guard let realURL = redirectURL else {
-            sendQuick(404, on: connection)
+            HTTPServerCommon.sendQuick(404, on: connection)
             return
         }
 
@@ -345,7 +372,7 @@ public final class AdStrippingProxy: @unchecked Sendable {
     /// AVPlayer refuses to schedule it (CoreMedia -12312).
     private func serveSlate(path: String, on connection: NWConnection) {
         guard let base = SlateSegment.data else {
-            sendQuick(404, on: connection)
+            HTTPServerCommon.sendQuick(404, on: connection)
             return
         }
         let body: Data
@@ -354,11 +381,11 @@ public final class AdStrippingProxy: @unchecked Sendable {
         } else {
             body = base
         }
-        send(status: 200, body: body, extraHeaders: [
+        HTTPServerCommon.sendResponse(status: 200, fields: [
             "Content-Type": "video/mp2t",
             "Content-Length": "\(body.count)",
             "Cache-Control": "no-cache",
-        ], on: connection)
+        ], body: body, on: connection)
     }
 
     /// Parses the global segment index from `/slate/{index}.ts`.
@@ -374,86 +401,79 @@ public final class AdStrippingProxy: @unchecked Sendable {
     private let slateLock = NSLock()
 
     private func slateCopy(at index: Int) -> Data? {
+        // Double-checked: the cache read and the (cheap) PTS rewrite are never
+        // both under the lock, so concurrent slate requests don't serialize.
         slateLock.lock()
-        defer { slateLock.unlock() }
-        if let cached = slateCopies[index] { return cached }
+        let cached = slateCopies[index]
+        slateLock.unlock()
+        if let cached { return cached }
+
         guard let base = SlateSegment.data else { return nil }
         let delta = Int64(index) * Int64(SlateSegment.duration * Double(SlateRewriter.ticksPerSecond))
         guard let rewritten = SlateRewriter.rewrite(base, adding: delta) else { return nil }
-        // Keep the cache bounded: a couple of breaks' worth is plenty.
-        if slateCopies.count > 128 { slateCopies.removeAll() }
+
+        slateLock.lock()
+        // Keep the cache bounded. If two connections rewrote the same index
+        // concurrently, the last one wins.
+        if slateCopies.count > Self.slateCacheLimit { slateCopies.removeAll() }
         slateCopies[index] = rewritten
+        slateLock.unlock()
         return rewritten
     }
 
     // MARK: - Redirect mapping
 
-    /// Maps proxy paths to real CDN URLs. Content keys are
-    /// `/seg/{variant}/{filename}` — the variant index keeps qualities apart
-    /// (same segment filenames across variants), and the filename keeps URLs
-    /// stable across reloads (AVPlayer identifies segments by URL). Init keys
-    /// keep a positional index: the same init file can legitimately recur in
-    /// one playlist (fMP4 re-init), and init segments are never the stall
-    /// vector — they are tiny and re-fetching is harmless.
-    private func cacheRedirectMappings(from originalPlaylist: String, variantBaseURL: URL, variantIdx: Int) {
-        let lines = originalPlaylist.components(separatedBy: .newlines)
-        var mapIdx = 0
-
+    /// Stores the proxy-path → CDN-URL mappings produced by the cleaner,
+    /// replacing the previous window's entries for this variant. Content keys
+    /// are `/seg/{variant}/{filename}` — the variant index keeps qualities
+    /// apart (same segment filenames across variants), and the filename keeps
+    /// URLs stable across reloads (AVPlayer identifies segments by URL). Init
+    /// keys keep a positional index: the same init file can legitimately recur
+    /// in one playlist (fMP4 re-init).
+    ///
+    /// Eviction is by sliding window: only the mappings of the latest poll
+    /// survive per variant, so the dictionary stays bounded (~a window's worth
+    /// of segments per quality) for the whole stream duration.
+    private func storeRedirectMappings(_ mappings: [(path: String, url: URL)], variantIdx: Int) {
+        let segPrefix = "/seg/\(variantIdx)/"
+        let initPrefix = "/init/\(variantIdx)/"
         stateLock.withLock {
-            for line in lines {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.hasPrefix("#EXT-X-MAP:URI=\"") {
-                    if let uri = extractURI(from: trimmed),
-                       let resolved = URL(string: uri, relativeTo: variantBaseURL)?.absoluteURL {
-                        let filename = HLSPlaylistCleaner.segmentFilename(uri)
-                        segmentRedirects["/init/\(variantIdx)/\(mapIdx)/\(filename)"] = resolved
-                        mapIdx += 1
-                    }
-                    continue
-                }
-                if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
-                if let resolved = URL(string: trimmed, relativeTo: variantBaseURL)?.absoluteURL {
-                    segmentRedirects["/seg/\(variantIdx)/\(resolved.lastPathComponent)"] = resolved
-                }
+            segmentRedirects = segmentRedirects.filter {
+                !$0.key.hasPrefix(segPrefix) && !$0.key.hasPrefix(initPrefix)
+            }
+            for mapping in mappings {
+                segmentRedirects[mapping.path] = mapping.url
             }
         }
-    }
-
-    private func extractURI(from line: String) -> String? {
-        guard let start = line.range(of: "URI=\"")?.upperBound,
-              let end = line[start...].range(of: "\"")?.lowerBound else { return nil }
-        return String(line[start..<end])
     }
 
     // MARK: - Response helpers
 
     private func serveManifest(text: String, on connection: NWConnection) {
-        guard let data = text.data(using: .utf8) else { sendQuick(500, on: connection); return }
-        send(status: 200, body: data, extraHeaders: [
+        guard let data = text.data(using: .utf8) else {
+            HTTPServerCommon.sendQuick(500, on: connection); return
+        }
+        HTTPServerCommon.sendResponse(status: 200, fields: [
             "Content-Type": "application/vnd.apple.mpegurl",
             "Content-Length": "\(data.count)",
             "Cache-Control": "no-cache",
-        ], on: connection)
+        ], body: data, on: connection)
     }
 
     private func sendRedirect(to url: URL, on connection: NWConnection) {
-        let s = "HTTP/1.1 302 Found\r\nLocation: \(url.absoluteString)\r\nConnection: close\r\n\r\n"
-        guard let data = s.data(using: .utf8) else { connection.cancel(); return }
-        connection.send(content: data, completion: .contentProcessed { _ in connection.cancel() })
+        HTTPServerCommon.sendResponse(status: 302, fields: ["Location": url.absoluteString],
+                                      body: Data(), on: connection)
     }
 
     private func streamSegment(from url: URL, rangeHeader: String?, on connection: NWConnection) {
-        // Closed ranges (bytes=A-B) are forwarded as-is. Open-ended ranges
-        // (bytes=A-) also pass through verbatim — an NSRange cannot express
-        // them without overflowing (`Int.max + 1`). Suffix ranges (bytes=-N)
-        // and malformed specs are rejected.
-        let isClosedRange: Bool
-        if let rh = rangeHeader, rh.lowercased().hasPrefix("bytes=") {
-            let spec = String(rh.dropFirst(6))
-            let bounds = spec.components(separatedBy: "-")
-            isClosedRange = bounds.count == 2 && !(bounds.first?.isEmpty ?? true) && !(bounds.last?.isEmpty ?? true)
-        } else {
-            isClosedRange = false
+        // Syntactically valid ranges (closed, open, suffix) are forwarded
+        // verbatim — the CDN handles them natively. Malformed specs are
+        // stripped rather than proxied: serving the full body is the safest
+        // fallback for AVPlayer.
+        let forwardRange: String?
+        switch HTTPServerCommon.parseRange(rangeHeader) {
+        case .closed, .open, .suffix: forwardRange = rangeHeader
+        case .absent, .invalid: forwardRange = nil
         }
 
         // STREAM the segment instead of buffering it: AVPlayer aborts a segment
@@ -461,93 +481,71 @@ public final class AdStrippingProxy: @unchecked Sendable {
         // in a loop, so the response headers must reach it as soon as the CDN
         // responds (~0.5 s TTFB), not after the full body has downloaded.
         let state = SegmentStreamState()
-        fetcher.streamSegment(
+        let connKey = ObjectIdentifier(connection)
+        let handle = fetcher.streamSegment(
             url: url,
-            rangeHeader: rangeHeader,
+            rangeHeader: forwardRange,
             queue: serverQueue,
-            onHeaders: { [weak self] status, length in
-                guard let self else { return }
+            onHeaders: { status, length, contentRange in
+                if status >= 400 {
+                    // CDN error (expired token 403, pruned segment 404…):
+                    // answer 502 and drop the body — never stream an HTML
+                    // error page to AVPlayer as if it were video/mp2t.
+                    state.cdnFailed = true
+                    HTTPServerCommon.sendQuick(502, on: connection)
+                    return
+                }
                 state.responded = true
-                var headers: [String: String] = [
+                var fields: [String: String] = [
                     "Content-Type": "video/mp2t",
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-cache",
                 ]
-                if length > 0 { headers["Content-Length"] = "\(length)" }
-                self.sendHeaders(status: isClosedRange ? 206 : status, extraHeaders: headers, on: connection)
+                if length > 0 { fields["Content-Length"] = "\(length)" }
+                // Relay the CDN's own 206 + Content-Range verbatim — never
+                // invent a 206 ourselves (a forged partial response with a
+                // missing/incorrect Content-Range corrupts the player).
+                if status == 206, let contentRange {
+                    fields["Content-Range"] = contentRange
+                }
+                HTTPServerCommon.sendHead(status: status, fields: fields, on: connection)
             },
             onData: { data in
+                guard !state.cdnFailed else { return }
                 connection.send(content: data, completion: .contentProcessed { _ in })
             },
-            onFinish: { error in
-                if error == nil {
+            onFinish: { [weak self] error in
+                guard let self else { return }
+                stateLock.withLock { _ = activeStreams.removeValue(forKey: connKey) }
+                if state.cdnFailed {
+                    // 502 already sent in onHeaders — just make sure the
+                    // connection is closed once the error body is drained.
+                    connection.cancel()
+                } else if error == nil {
                     // End of body — close (Connection: close is in the headers).
                     connection.send(content: nil, completion: .contentProcessed { _ in connection.cancel() })
                 } else if !state.responded {
                     print("🛡 AdStrippingProxy: segment fetch failed — \(error?.localizedDescription ?? "unknown")")
-                    self.sendQuick(502, on: connection)
+                    HTTPServerCommon.sendQuick(502, on: connection)
                 } else {
                     // Body truncated mid-stream — the player retries the segment.
                     connection.cancel()
                 }
             }
         )
+        // Registered after start() returns: all callbacks are dispatched on
+        // serverQueue, which is busy running this block — they can only fire
+        // after the registration below. teardownConnection (also on
+        // serverQueue) uses this to cancel the download if the client dies.
+        stateLock.withLock { activeStreams[connKey] = handle }
     }
 
-    /// Tracks whether response headers were already forwarded, so a failed
-    /// download can still produce a clean 502 when nothing was sent yet.
+    /// Mutable flags for an in-flight segment response: whether headers were
+    /// forwarded (a failure can then no longer become a clean 502) and whether
+    /// the CDN answered with an error status (body must be dropped). Only
+    /// touched on `serverQueue`, where all stream callbacks are dispatched.
     private final class SegmentStreamState: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _responded = false
-        var responded: Bool {
-            get { lock.lock(); defer { lock.unlock() }; return _responded }
-            set { lock.lock(); _responded = newValue; lock.unlock() }
-        }
-    }
-
-    /// Sends response headers only — the body follows through subsequent
-    /// `connection.send` calls (segment streaming).
-    private func sendHeaders(status: Int, extraHeaders: [String: String], on connection: NWConnection) {
-        var s = "HTTP/1.1 \(status) \(statusText(status))\r\n"
-        for (k, v) in extraHeaders { s += "\(k): \(v)\r\n" }
-        s += "Connection: close\r\n\r\n"
-        let data = Data(s.utf8)
-        connection.send(content: data, completion: .contentProcessed { _ in })
-    }
-
-    private func send(status: Int, body: Data, extraHeaders: [String: String], on connection: NWConnection) {
-        var s = "HTTP/1.1 \(status) \(statusText(status))\r\n"
-        for (k, v) in extraHeaders { s += "\(k): \(v)\r\n" }
-        s += "Connection: close\r\n\r\n"
-        var data = Data(s.utf8); data.append(body)
-        let conn = connection
-        connection.send(content: data, completion: .contentProcessed { _ in
-            // Small delay before cancel so AVPlayer has time to finish reading
-            // the response — avoids ECONNRESET races on loopback.
-            conn.cancel()
-        })
-    }
-
-    private func sendQuick(_ status: Int, on connection: NWConnection) {
-        send(status: status, body: Data(), extraHeaders: [:], on: connection)
-    }
-
-    private func statusText(_ code: Int) -> String {
-        switch code {
-        case 200: "OK"; case 206: "Partial Content"; case 302: "Found"
-        case 400: "Bad Request"; case 404: "Not Found"
-        case 500: "Internal Server Error"; case 502: "Bad Gateway"
-        default: "Unknown"
-        }
-    }
-
-    private func extractHeader(_ name: String, from raw: String) -> String? {
-        let key = name.lowercased() + ":"
-        for line in raw.components(separatedBy: "\r\n") {
-            if line.lowercased().hasPrefix(key) {
-                return String(line.dropFirst(key.count)).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return nil
+        var responded = false
+        var cdnFailed = false
     }
 }

@@ -70,10 +70,12 @@ public final class TSPlayerItem {
     }
 }
 
-enum TSPlayerItemError: Error, LocalizedError {
+/// Errors thrown by the `TSPlayerItem` initializers.
+public enum TSPlayerItemError: Error, LocalizedError {
     case emptySegments
     case missingFileField
-    var errorDescription: String? {
+
+    public var errorDescription: String? {
         switch self {
         case .emptySegments: "Segments array must not be empty."
         case .missingFileField: "Multi-file segments must have a non-nil `file` field."

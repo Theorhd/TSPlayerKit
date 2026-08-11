@@ -138,7 +138,7 @@ final class DynamicOriginServer: @unchecked Sendable {
         // Headers first — always immediate — then the body (possibly delayed,
         // simulating a slow CDN transfer).
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        let sendBody = {
+        let sendBody: @Sendable () -> Void = {
             connection.send(content: body, completion: .contentProcessed { _ in connection.cancel() })
         }
         if delayBodyBy > 0 {
@@ -163,8 +163,11 @@ struct AVPlayerLiveIntegrationTests {
 
         let ffmpeg = "/opt/homebrew/bin/ffmpeg"
         guard FileManager.default.isExecutableFile(atPath: ffmpeg) else {
-            throw NSError(domain: "Test", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "ffmpeg not found at \(ffmpeg)"])
+            // This swift-testing version has no runtime skip API — record a
+            // warning (does not fail the suite) and return.
+            Issue.record("ffmpeg not found at \(ffmpeg) — real-player integration test not run",
+                         severity: .warning)
+            return []
         }
 
         let process = Process()
@@ -205,6 +208,8 @@ struct AVPlayerLiveIntegrationTests {
     @MainActor
     func playbackSurvivesAdBreak() async throws {
         let segments = try Self.generateSegments()
+        // Empty = ffmpeg missing — generateSegments already recorded a warning.
+        guard !segments.isEmpty else { return }
         #expect(segments.count >= 10, "ffmpeg produced too few segments: \(segments.count)")
 
         let origin = try DynamicOriginServer(
