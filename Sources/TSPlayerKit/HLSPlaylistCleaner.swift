@@ -17,6 +17,11 @@ import Foundation
 ///   advancing, so AVPlayer never sees a stalled/empty playlist — removing all
 ///   segments of a full ad-break window used to trigger CoreMediaErrorDomain
 ///   -12888 ("Playlist File unchanged for longer than 1.5 × target duration").
+///   Slate URLs are the occurrence's global segment index (stable across
+///   reloads — AVPlayer stalls if a live segment's URL changes between polls),
+///   and the proxy rewrites each copy's PTS onto the content timeline, so the
+///   run is timestamp-continuous and needs no DISCONTINUITY (which itself
+///   stalls AVPlayer at the live edge).
 /// - **Live fMP4** (has `#EXT-X-MAP`) or slate unavailable: fall back to
 ///   removal — an empty window is valid HLS, and fMP4 cannot mix a TS slate
 ///   under an active init-map declaration.
@@ -144,6 +149,13 @@ struct HLSPlaylistCleaner {
         let hasInitMap = lines.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXT-X-MAP:") }
         let useSlate = slatePathPrefix != nil && !isVOD && !hasInitMap
 
+        // Current MEDIA-SEQUENCE — used to keep slate placeholder URLs unique
+        // across reloads (see slate path below).
+        let mediaSequence = lines
+            .first { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXT-X-MEDIA-SEQUENCE:") }
+            .flatMap { $0.components(separatedBy: ":").last }
+            .flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+
         var removedIndices = Set<Int>()
         var replacedIndices = Set<Int>()
 
@@ -199,7 +211,8 @@ struct HLSPlaylistCleaner {
             segmentPathPrefix: segmentPathPrefix,
             initPathPrefix: initPathPrefix,
             slatePathPrefix: slatePathPrefix,
-            slateDuration: slateDuration
+            slateDuration: slateDuration,
+            mediaSequence: mediaSequence
         )
 
         return CleanResult(
@@ -478,7 +491,8 @@ struct HLSPlaylistCleaner {
         segmentPathPrefix: String,
         initPathPrefix: String,
         slatePathPrefix: String?,
-        slateDuration: Double
+        slateDuration: Double,
+        mediaSequence: Int?
     ) -> String {
         var result: [String] = []
         var segmentIndex = 0
@@ -566,34 +580,40 @@ struct HLSPlaylistCleaner {
 
             if let slatePathPrefix, replacedIndices.contains(segmentIndex) {
                 if !inSlateRun {
-                    // Entering a slate run: close any encryption scope first
-                    // (slate is in the clear)…
+                    // Entering a slate run: close any encryption scope (slate
+                    // is in the clear). NO discontinuity is emitted: the proxy
+                    // shifts every copy's PTS onto the content timeline, so the
+                    // run is timestamp-continuous — and a discontinuity at the
+                    // live edge makes AVPlayer stall (it cannot re-anchor
+                    // mid-edge; empirically verified).
                     if activeKeyLine != nil {
                         result.append("#EXT-X-KEY:METHOD=NONE")
                     }
                     inSlateRun = true
                 }
-                // …then a hard boundary before EVERY slate segment. Every slate
-                // copy is the same file with the same PTS (starts ~1.4s); without
-                // a discontinuity before each one, CoreMedia sees PTS regression
-                // across identical copies and stalls (timebase -12753, then
-                // MEDIA_PLAYBACK_STALL during the whole ad break).
-                appendDiscontinuityIfNeeded()
                 // The slate has a fixed duration — align EXTINF with reality.
                 pendingEXTINF = nil
                 result.append("#EXTINF:\(String(format: "%.3f", slateDuration)),")
-                result.append("\(proxyBaseURL)\(slatePathPrefix)/\(segmentIndex).ts")
+                // URL = the occurrence's GLOBAL segment index
+                // (MEDIA-SEQUENCE + position). This is STABLE across reloads —
+                // AVPlayer identifies segments by URL and stalls if a live
+                // segment's URL changes between polls. It also lets the proxy
+                // compute the PTS shift: globalIndex × duration ≈ the content
+                // timeline position.
+                let global = (mediaSequence ?? 0) + segmentIndex
+                result.append("\(proxyBaseURL)\(slatePathPrefix)/\(global).ts")
                 previousSegmentWasAd = true
                 segmentIndex += 1
                 continue
             }
 
-            // Content boundary after an ad run (removed or replaced): insert a
-            // discontinuity (unless the playlist already has one right there).
+            // Content boundary after an ad run: reopen the encryption scope
+            // closed for the slate run. No discontinuity — the timeline is
+            // continuous (every slate copy is PTS-shifted onto the content
+            // scale by the proxy), and a discontinuity at the live edge stalls
+            // AVPlayer.
             if previousSegmentWasAd {
-                appendDiscontinuityIfNeeded()
                 if inSlateRun, let key = activeKeyLine {
-                    // Reopen the encryption scope closed for the slate run.
                     result.append(key)
                 }
                 previousSegmentWasAd = false
@@ -605,7 +625,13 @@ struct HLSPlaylistCleaner {
                 pendingEXTINF = nil
             }
 
-            let proxyURL = "\(proxyBaseURL)\(segmentPathPrefix)/\(segmentIndex)/\(Self.segmentFilename(trimmed))"
+            // URL keyed by the segment's FILENAME, not its position in this
+            // playlist. AVPlayer treats a URL seen in a previous reload as the
+            // same segment; position-based URLs change as the window slides and
+            // would read as "new" segments, while reused slate URLs read as
+            // "already played". Filename-based URLs stay stable across reloads,
+            // exactly like the CDN's own URLs.
+            let proxyURL = "\(proxyBaseURL)\(segmentPathPrefix)/\(Self.segmentFilename(trimmed))"
             result.append(proxyURL)
             segmentIndex += 1
         }

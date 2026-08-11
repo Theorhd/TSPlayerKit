@@ -199,7 +199,7 @@ public final class AdStrippingProxy: @unchecked Sendable {
         case let p where p.hasPrefix("/init/"):
             serveInit(path: p, on: connection)
         case let p where p.hasPrefix("/slate/"):
-            serveSlate(on: connection)
+            serveSlate(path: p, on: connection)
         default:
             sendQuick(404, on: connection)
         }
@@ -335,30 +335,68 @@ public final class AdStrippingProxy: @unchecked Sendable {
         }
     }
 
-    /// Serves the embedded slate placeholder segment. The path suffix (segment
-    /// index) only exists to keep URLs unique across polls — the bytes are
-    /// always the same, served straight from memory with no network round-trip.
-    private func serveSlate(on connection: NWConnection) {
-        guard let data = SlateSegment.data else {
+    /// Serves the embedded slate placeholder segment. The path is the
+    /// occurrence's GLOBAL segment index (`/slate/{index}.ts`) — stable across
+    /// reloads (AVPlayer stalls if a live segment's URL changes between polls)
+    /// and the basis for the PTS shift: each copy is shifted by `index ×
+    /// duration` ticks so its timestamps land on the content timeline (Twitch
+    /// content PTS ≈ uptime + the same ~1.4 s encoder base the slate carries).
+    /// Unshifted, the copy's near-zero PTS sits BEHIND the playhead and
+    /// AVPlayer refuses to schedule it (CoreMedia -12312).
+    private func serveSlate(path: String, on connection: NWConnection) {
+        guard let base = SlateSegment.data else {
             sendQuick(404, on: connection)
             return
         }
-        send(status: 200, body: data, extraHeaders: [
+        let body: Data
+        if let index = slateIndex(from: path), let rewritten = slateCopy(at: index) {
+            body = rewritten
+        } else {
+            body = base
+        }
+        send(status: 200, body: body, extraHeaders: [
             "Content-Type": "video/mp2t",
-            "Content-Length": "\(data.count)",
+            "Content-Length": "\(body.count)",
             "Cache-Control": "no-cache",
         ], on: connection)
     }
 
+    /// Parses the global segment index from `/slate/{index}.ts`.
+    private func slateIndex(from path: String) -> Int? {
+        let component = path.components(separatedBy: "/").last ?? ""
+        let noExt = component.hasSuffix(".ts") ? String(component.dropLast(3)) : component
+        return Int(noExt)
+    }
+
+    /// Rewritten slate copies, keyed by global index — the same occurrence is
+    /// requested repeatedly while it stays in the window.
+    private var slateCopies: [Int: Data] = [:]
+    private let slateLock = NSLock()
+
+    private func slateCopy(at index: Int) -> Data? {
+        slateLock.lock()
+        defer { slateLock.unlock() }
+        if let cached = slateCopies[index] { return cached }
+        guard let base = SlateSegment.data else { return nil }
+        let delta = Int64(index) * Int64(SlateSegment.duration * Double(SlateRewriter.ticksPerSecond))
+        guard let rewritten = SlateRewriter.rewrite(base, adding: delta) else { return nil }
+        // Keep the cache bounded: a couple of breaks' worth is plenty.
+        if slateCopies.count > 128 { slateCopies.removeAll() }
+        slateCopies[index] = rewritten
+        return rewritten
+    }
+
     // MARK: - Redirect mapping
 
-    /// Maps proxy paths to real CDN URLs. Keys include the variant index
-    /// (`/seg/{variant}/{index}/{file}`) because different qualities reuse the
-    /// same segment filenames — without it, a quality switch would serve the
-    /// previous variant's segments.
+    /// Maps proxy paths to real CDN URLs. Content keys are
+    /// `/seg/{variant}/{filename}` — the variant index keeps qualities apart
+    /// (same segment filenames across variants), and the filename keeps URLs
+    /// stable across reloads (AVPlayer identifies segments by URL). Init keys
+    /// keep a positional index: the same init file can legitimately recur in
+    /// one playlist (fMP4 re-init), and init segments are never the stall
+    /// vector — they are tiny and re-fetching is harmless.
     private func cacheRedirectMappings(from originalPlaylist: String, variantBaseURL: URL, variantIdx: Int) {
         let lines = originalPlaylist.components(separatedBy: .newlines)
-        var segIdx = 0
         var mapIdx = 0
 
         stateLock.withLock {
@@ -375,9 +413,8 @@ public final class AdStrippingProxy: @unchecked Sendable {
                 }
                 if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
                 if let resolved = URL(string: trimmed, relativeTo: variantBaseURL)?.absoluteURL {
-                    segmentRedirects["/seg/\(variantIdx)/\(segIdx)/\(resolved.lastPathComponent)"] = resolved
+                    segmentRedirects["/seg/\(variantIdx)/\(resolved.lastPathComponent)"] = resolved
                 }
-                segIdx += 1
             }
         }
     }
@@ -406,26 +443,30 @@ public final class AdStrippingProxy: @unchecked Sendable {
     }
 
     private func streamSegment(from url: URL, rangeHeader: String?, on connection: NWConnection) {
+        // Closed ranges (bytes=A-B) are forwarded as-is. Open-ended ranges
+        // (bytes=A-) also pass through verbatim — an NSRange cannot express
+        // them without overflowing (`Int.max + 1`). Suffix ranges (bytes=-N)
+        // and malformed specs are rejected.
+        let isClosedRange: Bool
+        if let rh = rangeHeader, rh.lowercased().hasPrefix("bytes=") {
+            let spec = String(rh.dropFirst(6))
+            let bounds = spec.components(separatedBy: "-")
+            isClosedRange = bounds.count == 2 && !(bounds.first?.isEmpty ?? true) && !(bounds.last?.isEmpty ?? true)
+        } else {
+            isClosedRange = false
+        }
+
         Task {
             do {
-                var nsRange: NSRange?
-                if let rh = rangeHeader, rh.lowercased().hasPrefix("bytes=") {
-                    let spec = String(rh.dropFirst(6))
-                    let bounds = spec.components(separatedBy: "-")
-                    if let s = bounds.first, !s.isEmpty, let sv = Int(s) {
-                        var end = Int.max
-                        if bounds.count > 1, let e = bounds.last, !e.isEmpty, let ev = Int(e) { end = ev }
-                        nsRange = NSRange(location: sv, length: end - sv + 1)
-                    }
-                }
-                let (data, contentType) = try await fetcher.fetchSegment(url: url, range: nsRange)
-                send(status: nsRange != nil ? 206 : 200, body: data, extraHeaders: [
+                let (data, contentType) = try await fetcher.fetchSegment(url: url, rangeHeader: rangeHeader)
+                send(status: isClosedRange ? 206 : 200, body: data, extraHeaders: [
                     "Content-Type": contentType ?? "video/mp2t",
                     "Content-Length": "\(data.count)",
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-cache",
                 ], on: connection)
             } catch {
+                print("🛡 AdStrippingProxy: segment fetch failed — \(error.localizedDescription)")
                 sendQuick(502, on: connection)
             }
         }

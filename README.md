@@ -267,10 +267,10 @@ player.play()
 
 **Traitement des pubs selon le type de flux** :
 - **VOD** — les segments pubs sont *supprimés* de la playlist (le break est sauté).
-- **Live (TS)** — les segments pubs sont *remplacés* par un segment placeholder local (« slate » : 2 s d'écran noir + silence, MPEG-TS embarqué en ressource). Pendant une pause publicitaire, la fenêtre glissante Twitch peut être 100 % pubs : tout supprimer produisait une playlist vide qu'AVPlayer abandonnait après 1,5 × TARGETDURATION (`CoreMediaErrorDomain -12888`). Avec le slate, la playlist avance normalement, la lecture survit à la pause (écran noir) et reprend sur le contenu au `EXT-X-DISCONTINUITY` suivant.
+- **Live (TS)** — les segments pubs sont *remplacés* par un segment placeholder local (« slate » : 2 s d'écran noir + silence, MPEG-TS embarqué en ressource). Pendant une pause publicitaire, la fenêtre glissante Twitch peut être 100 % pubs : tout supprimer produisait une playlist vide qu'AVPlayer abandonnait après 1,5 × TARGETDURATION (`CoreMediaErrorDomain -12888`). Avec le slate, la playlist avance normalement et la lecture survit à la pause.
 - **Live fMP4** (`#EXT-X-MAP`) ou ressource slate indisponible — repli sur la suppression (comportement antérieur).
 
-Le slate est servi localement sur `/slate/{index}.ts` (aucun aller-retour réseau). Si le flux est chiffré (`#EXT-X-KEY`), le cleaner ferme la portée de la clé (`METHOD=NONE`) pendant le slate et la ré-ouvre à la reprise du contenu.
+Le slate est servi localement sur `/slate/{index}.ts` (aucun aller-retour réseau) : l'index est l'index global du segment (URL **stable** d'un poll à l'autre — AVPlayer stoppe si l'URL d'un segment live change — et base du décalage de timestamps). Chaque copie est réécrite à la volée : layout PES standardisé et PTS décalé sur la timeline du contenu (`index × durée`), si bien que le run de slate est **continu en timestamps et ne nécessite aucun `EXT-X-DISCONTINUITY`** (un discontinuity à la live edge fait stall AVPlayer, `CoreMediaErrorDomain -12312`). Si le flux est chiffré (`#EXT-X-KEY`), le cleaner ferme la portée de la clé (`METHOD=NONE`) pendant le slate et la ré-ouvre à la reprise du contenu.
 
 **Modes de segments** :
 - `.stream` (défaut) — le proxy fetch et relaye les bytes des segments

@@ -714,8 +714,8 @@ struct HLSPlaylistCleanerTests {
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
         #expect(result.adSegmentCount == 0)
         #expect(!result.adReplaced)
-        #expect(result.playlist.contains("seg/0/0.ts"))
-        #expect(result.playlist.contains("seg/1/1.ts"))
+        #expect(result.playlist.contains("seg/0.ts"))
+        #expect(result.playlist.contains("seg/1.ts"))
         // The raw "0.ts" on its own line must not survive.
         #expect(!result.playlist.contains("\n0.ts\n"))
     }
@@ -747,11 +747,12 @@ struct HLSPlaylistCleanerTests {
         #expect(result.removedIndices.contains(2))
         #expect(!result.removedIndices.contains(0))
         #expect(!result.removedIndices.contains(3))
-        // Index 3 segment (original) survives but is now at rewritten position after removals;
-        // it appears as /seg/3/3.ts (original index preserved).
-        #expect(result.playlist.contains("/seg/3/3.ts"))
+        // Segment URLs are filename-keyed (stable across reloads).
+        #expect(result.playlist.contains("/seg/3.ts"))
         #expect(!result.playlist.contains("ad1.ts"))
-        #expect(result.playlist.contains("#EXT-X-DISCONTINUITY"))
+        // No discontinuity: the surviving content has continuous PTS, and a
+        // discontinuity at the live edge stalls AVPlayer.
+        #expect(!result.playlist.contains("#EXT-X-DISCONTINUITY"))
     }
 
     // ── SCTE35-OUT with duration (no SCTE35-IN) — bounded removal ──
@@ -982,8 +983,8 @@ struct HLSPlaylistCleanerTests {
         #expect(!result.playlist.contains("PRELOAD-HINT"))
         #expect(!result.playlist.contains("RENDITION-REPORT"))
         // Content segments survive.
-        #expect(result.playlist.contains("seg/0/0.ts"))
-        #expect(result.playlist.contains("seg/1/1.ts"))
+        #expect(result.playlist.contains("seg/0.ts"))
+        #expect(result.playlist.contains("seg/1.ts"))
         #expect(result.adSegmentCount == 0)
     }
 
@@ -1039,11 +1040,12 @@ struct HLSPlaylistCleanerTests {
             variant, proxyBaseURL: "http://127.0.0.1:9999", slatePathPrefix: "/slate"
         )
         #expect(!result.playlist.contains("PROGRAM-DATE-TIME"))
-        // Content and slate entries survive.
-        #expect(result.playlist.contains("seg/0/content0.ts"))
+        // Content and slate entries survive (no MEDIA-SEQUENCE in this fixture
+        // → global index = position: 1, 2).
+        #expect(result.playlist.contains("seg/content0.ts"))
         #expect(result.playlist.contains("/slate/1.ts"))
         #expect(result.playlist.contains("/slate/2.ts"))
-        #expect(result.playlist.contains("seg/3/content1.ts"))
+        #expect(result.playlist.contains("seg/content1.ts"))
     }
 
     // ── #EXT-X-MAP (fMP4 init) rewriting ──
@@ -1066,10 +1068,14 @@ struct HLSPlaylistCleanerTests {
         #expect(!result.playlist.contains("URI=\"init.mp4\""))
     }
 
-    // ── Discontinuity insertion ──
+    // ── Discontinuity behavior ──
 
-    @Test("cleanVariantPlaylist inserts DISCONTINUITY after ad block")
-    func cleanDiscontinuityAfterAd() {
+    @Test("cleanVariantPlaylist does not insert DISCONTINUITY around an ad block")
+    func cleanNoDiscontinuityAfterAd() {
+        // Removed (or slate-replaced) ads leave the surviving content on both
+        // sides with continuous PTS — the player skips the gap natively. An
+        // explicit discontinuity at the live edge makes AVPlayer stall, so the
+        // cleaner must NOT insert one.
         let variant = """
         #EXTM3U
         #EXT-X-TARGETDURATION:2
@@ -1087,17 +1093,14 @@ struct HLSPlaylistCleanerTests {
         """
 
         let result = cleaner.cleanVariantPlaylist(variant, proxyBaseURL: "http://127.0.0.1:9999")
-        #expect(result.playlist.contains("#EXT-X-DISCONTINUITY"))
-        // The DISCONTINUITY sits between the surviving before and after segments.
+        #expect(!result.playlist.contains("#EXT-X-DISCONTINUITY"))
         let lines = result.playlist.components(separatedBy: .newlines)
-        let discIdx = lines.firstIndex(of: "#EXT-X-DISCONTINUITY")
-        #expect(discIdx != nil)
         let beforeIdx = lines.firstIndex(where: { $0.contains("before.ts") })
         let afterIdx = lines.firstIndex(where: { $0.contains("after.ts") })
         #expect(beforeIdx != nil)
         #expect(afterIdx != nil)
-        #expect(discIdx! > beforeIdx!)
-        #expect(discIdx! < afterIdx!)
+        // Both content segments survive; the ads in between are gone.
+        #expect(beforeIdx! < afterIdx!)
     }
 
     // ── segmentFilename ──
@@ -1185,29 +1188,27 @@ struct SlateSubstitutionTests {
         #expect(result.removedIndices.isEmpty)
         #expect(result.adReplaced)
 
-        // Ad URLs are gone; slate placeholders took their slot.
+        // Ad URLs are gone; slate placeholders took their slot. Slate URLs are
+        // the GLOBAL indices (MEDIA-SEQUENCE 100 + position): 101, 102.
         #expect(!result.playlist.contains("ad101.ts"))
         #expect(!result.playlist.contains("ad102.ts"))
-        #expect(result.playlist.contains("/slate/1.ts"))
-        #expect(result.playlist.contains("/slate/2.ts"))
+        #expect(result.playlist.contains("/slate/101.ts"))
+        #expect(result.playlist.contains("/slate/102.ts"))
 
         // Media sequence is preserved so AVPlayer sees the playlist advancing.
         #expect(result.playlist.contains("#EXT-X-MEDIA-SEQUENCE:100"))
 
-        // Discontinuities bracket the slate run AND separate every slate copy
-        // (identical PTS across copies → CoreMedia needs a timebase reset per
-        // segment, otherwise it stalls during the whole ad break).
+        // The slate run carries NO discontinuities: the proxy shifts each
+        // copy's PTS onto the content timeline, and a discontinuity at the
+        // live edge stalls AVPlayer (empirically verified).
         let lines = result.playlist.components(separatedBy: .newlines)
         let contentIdx = lines.firstIndex(where: { $0.contains("seg100.ts") })
-        let slate1Idx = lines.firstIndex(where: { $0.contains("/slate/1.ts") })
-        let slate2Idx = lines.firstIndex(where: { $0.contains("/slate/2.ts") })
+        let slate1Idx = lines.firstIndex(where: { $0.contains("/slate/101.ts") })
+        let slate2Idx = lines.firstIndex(where: { $0.contains("/slate/102.ts") })
         let resumeIdx = lines.firstIndex(where: { $0.contains("seg103.ts") })
         #expect(contentIdx != nil && slate1Idx != nil && slate2Idx != nil && resumeIdx != nil)
         let discontinuities = lines.indices.filter { lines[$0] == "#EXT-X-DISCONTINUITY" }
-        #expect(discontinuities.count == 3)
-        #expect(discontinuities[0] > contentIdx! && discontinuities[0] < slate1Idx!)
-        #expect(discontinuities[1] > slate1Idx! && discontinuities[1] < slate2Idx!)
-        #expect(discontinuities[2] > slate2Idx! && discontinuities[2] < resumeIdx!)
+        #expect(discontinuities.isEmpty)
     }
 
     @Test("Full-ad live window becomes all-slate, never empty (regression: -12888)")
@@ -1234,10 +1235,11 @@ struct SlateSubstitutionTests {
 
         #expect(result.replacedIndices == [0, 1, 2])
         #expect(result.removedIndices.isEmpty)
-        // Every original slot is still a playable segment.
-        #expect(result.playlist.contains("/slate/0.ts"))
-        #expect(result.playlist.contains("/slate/1.ts"))
-        #expect(result.playlist.contains("/slate/2.ts"))
+        // Every original slot is still a playable segment (global indices
+        // 200 + position).
+        #expect(result.playlist.contains("/slate/200.ts"))
+        #expect(result.playlist.contains("/slate/201.ts"))
+        #expect(result.playlist.contains("/slate/202.ts"))
         let segmentLines = result.playlist.components(separatedBy: .newlines).filter {
             let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
             return !t.isEmpty && !t.hasPrefix("#")
@@ -1398,6 +1400,51 @@ struct AdStrippingProxyTests {
         #expect(data!.first == 0x47)           // sync byte
     }
 
+    @Test("SlateRewriter: standard PES layout with PTS at position×duration")
+    func slateRewriterLayout() throws {
+        let raw = try #require(SlateSegment.data)
+        // delta = 3 × 2 s × 90 kHz — a copy at playlist position 3.
+        let rewritten = try #require(SlateRewriter.rewrite(raw, adding: 540_000))
+
+        // Same packet count; the rewrite only touches PES header bytes.
+        #expect(rewritten.count == raw.count)
+
+        // Find the first video PES and its PTS. The REWRITTEN copy carries it
+        // at the standard payload+8; the RAW asset keeps it at payload+9
+        // (non-standard layout — exactly what the rewriter fixes).
+        func firstVideoPTS(_ data: Data, ptsOffset: Int) -> (flagsOffset: Int, pts: Int64)? {
+            var i = 0
+            while i + 188 <= data.count {
+                if data[i] == 0x47 {
+                    let adaptation = (data[i + 3] >> 4) & 0x03
+                    var payload = i + 4
+                    if adaptation == 2 { i += 188; continue }
+                    if adaptation == 3 { payload += 1 + Int(data[i + 4]) }
+                    if payload + 14 <= i + 188,
+                       data[payload] == 0, data[payload + 1] == 0, data[payload + 2] == 1,
+                       (0xE0...0xEF).contains(data[payload + 3]) {
+                        let off = payload + ptsOffset
+                        let b0 = Int64(data[off]), b1 = Int64(data[off + 1])
+                        let b2 = Int64(data[off + 2]), b3 = Int64(data[off + 3])
+                        let b4 = Int64(data[off + 4])
+                        let pts = ((b0 & 0x0E) << 29) | (b1 << 22) | ((b2 & 0xFE) << 14) | (b3 << 7) | (b4 >> 1)
+                        return (payload + 6, pts)
+                    }
+                }
+                i += 188
+            }
+            return nil
+        }
+
+        let origVideo = try #require(firstVideoPTS(raw, ptsOffset: 9))
+        let newVideo = try #require(firstVideoPTS(rewritten, ptsOffset: 8))
+        #expect(rewritten[newVideo.flagsOffset] == 0xA0, "flags must declare PTS present")
+        #expect(rewritten[newVideo.flagsOffset + 1] == 0x05, "PES header length must be 5")
+        // Shifted by the delta, preserving the asset's own base offset.
+        #expect(newVideo.pts == origVideo.pts + 540_000,
+                "PTS must be shifted by exactly the delta (got \(newVideo.pts), expected \(origVideo.pts + 540_000))")
+    }
+
     @Test("/slate/ route serves the placeholder segment over HTTP")
     func slateRouteServesSegment() async throws {
         let fetcher = RemotePlaylistFetcher(userAgent: "TSPlayerKitTests")
@@ -1407,13 +1454,22 @@ struct AdStrippingProxyTests {
         )
         defer { proxy.stop() }
 
-        let slateURL = URL(string: "http://127.0.0.1:\(proxy.localURL.port!)/slate/0.ts")!
+        let slateURL = URL(string: "http://127.0.0.1:\(proxy.localURL.port!)/slate/5.ts")!
         let (data, response) = try await URLSession.shared.data(from: slateURL)
         let httpResponse = response as! HTTPURLResponse
 
         #expect(httpResponse.statusCode == 200)
         #expect(httpResponse.value(forHTTPHeaderField: "Content-Type") == "video/mp2t")
-        #expect(data == SlateSegment.data)
+        // The served copy is the REWRITTEN slate (standard PES layout, PTS at
+        // position×2s), not the raw asset — AVPlayer needs the rewritten form.
+        #expect(data != SlateSegment.data)
+        #expect(data.count == SlateSegment.data?.count)
+        #expect(data.first == 0x47)
+        if let raw = SlateSegment.data {
+            // Both start on the same transport packets — only PES headers differ.
+            let deltaCount = zip(data, raw).filter { $0 != $1 }.count
+            #expect(deltaCount < 64, "Expected only PES header bytes to differ, got \(deltaCount)")
+        }
     }
 
     @Test("End-to-end: live ad break flows through the proxy as slate segments")
@@ -1471,18 +1527,20 @@ struct AdStrippingProxyTests {
         #expect(variant.contains("#EXT-X-MEDIA-SEQUENCE:100"))
         #expect(!variant.contains("ad101.ts"))
         #expect(!variant.contains("ad102.ts"))
-        #expect(variant.contains("/slate/1.ts"))
-        #expect(variant.contains("/slate/2.ts"))
-        #expect(variant.contains("/seg/0/0/seg100.ts"))
-        #expect(variant.contains("/seg/0/3/seg103.ts"))
+        #expect(variant.contains("/slate/101.ts"))
+        #expect(variant.contains("/slate/102.ts"))
+        #expect(variant.contains("/seg/0/seg100.ts"))
+        #expect(variant.contains("/seg/0/seg103.ts"))
 
-        // The slate placeholder is served locally…
-        let (slateData, slateResp) = try await URLSession.shared.data(from: URL(string: "\(base)/slate/1.ts")!)
+        // The slate placeholder is served locally — as the REWRITTEN copy
+        // (standard PES layout, PTS shifted by 101 × 2 s = 202 s).
+        let (slateData, slateResp) = try await URLSession.shared.data(from: URL(string: "\(base)/slate/101.ts")!)
         #expect((slateResp as! HTTPURLResponse).statusCode == 200)
-        #expect(slateData == SlateSegment.data)
+        #expect(slateData != SlateSegment.data)
+        #expect(slateData.count == SlateSegment.data?.count)
 
         // …and content segments stream through from the origin untouched.
-        let (segData, segResp) = try await URLSession.shared.data(from: URL(string: "\(base)/seg/0/0/seg100.ts")!)
+        let (segData, segResp) = try await URLSession.shared.data(from: URL(string: "\(base)/seg/0/seg100.ts")!)
         #expect((segResp as! HTTPURLResponse).statusCode == 200)
         #expect(segData == contentBytes)
     }

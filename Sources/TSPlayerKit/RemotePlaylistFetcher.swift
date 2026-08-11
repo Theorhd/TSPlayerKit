@@ -80,6 +80,15 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
 
     /// Fetches a media segment and returns its data and content type.
     public func fetchSegment(url: URL, range: NSRange? = nil) async throws -> (data: Data, contentType: String?) {
+        let header = range.map { "bytes=\($0.location)-\($0.location + $0.length - 1)" }
+        return try await fetchSegment(url: url, rangeHeader: header)
+    }
+
+    /// Fetches a media segment, forwarding a raw HTTP `Range` header verbatim.
+    /// Prefer this over the `NSRange` variant: open-ended ranges (`bytes=0-`)
+    /// cannot be represented as an `NSRange` without overflow, and the CDN
+    /// handles the raw syntax natively.
+    public func fetchSegment(url: URL, rangeHeader: String?) async throws -> (data: Data, contentType: String?) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         // Bypass the cache entirely — segments are large and immutable, caching
@@ -89,8 +98,8 @@ public final class RemotePlaylistFetcher: @unchecked Sendable {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        if let range = range {
-            request.setValue("bytes=\(range.location)-\(range.location + range.length - 1)", forHTTPHeaderField: "Range")
+        if let rangeHeader, rangeHeader.lowercased().hasPrefix("bytes=") {
+            request.setValue(rangeHeader, forHTTPHeaderField: "Range")
         }
 
         let (data, response) = try await session.data(for: request)
