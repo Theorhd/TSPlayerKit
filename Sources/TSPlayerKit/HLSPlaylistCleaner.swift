@@ -483,7 +483,29 @@ struct HLSPlaylistCleaner {
             segmentIndex += 1
         }
 
-        return result.joined(separator: "\n")
+        // Bump TARGETDURATION to at least 6s. The original value (often 2s for
+        // LL-HLS live streams) gives AVPlayer a 1.5× = 3-second window before it
+        // declares the playlist "unchanged" (error -12888). After stripping LL-HLS
+        // tags we are serving standard HLS, which typically uses 6–10s, and the
+        // proxy adds a full round-trip to Twitch on every poll — more breathing
+        // room avoids spurious failures on slow or unstable connections.
+        let minTarget = 6
+        var bumped: [String] = []
+        for line in result {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("#EXT-X-TARGETDURATION:") {
+                if let colon = trimmed.firstIndex(of: ":"),
+                   let value = Int(trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespaces)) {
+                    bumped.append("#EXT-X-TARGETDURATION:\(max(value, minTarget))")
+                } else {
+                    bumped.append(line)
+                }
+            } else {
+                bumped.append(line)
+            }
+        }
+
+        return bumped.joined(separator: "\n")
     }
 
     // MARK: - URI helpers

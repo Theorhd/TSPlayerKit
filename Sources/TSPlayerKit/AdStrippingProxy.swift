@@ -65,7 +65,12 @@ public final class AdStrippingProxy: @unchecked Sendable {
 
     private func start() throws {
         let params = NWParameters.tcp
+        // Enable TCP_NODELAY — our responses are small and latency matters.
+        params.allowLocalEndpointReuse = true
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        // Keep connections alive briefly in case AVPlayer sends pipelined requests
+        // (it doesn't, but the setting is harmless).
+        params.allowFastOpen = true
 
         let listener: NWListener
         do { listener = try NWListener(using: params) }
@@ -77,8 +82,11 @@ public final class AdStrippingProxy: @unchecked Sendable {
             case .ready:
                 if let p = listener.port { self.port = p.rawValue }
                 self.readySemaphore.signal()
-            case .failed:
+            case .failed(let err):
+                print("🛡 AdStrippingProxy: NWListener failed — \(err.localizedDescription)")
                 self.readySemaphore.signal()
+            case .cancelled:
+                print("🛡 AdStrippingProxy: NWListener cancelled")
             default: break
             }
         }
