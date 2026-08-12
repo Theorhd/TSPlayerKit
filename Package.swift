@@ -6,9 +6,10 @@ import PackageDescription
 let package = Package(
     name: "TSPlayerKit",
     platforms: [
-        .macOS(.v10_15),
-        .iOS(.v13),
-        .tvOS(.v13),
+        // `URLSession.data(for:)` requires iOS 15 / macOS 12 / tvOS 15.
+        .macOS(.v12),
+        .iOS(.v15),
+        .tvOS(.v15),
         .visionOS(.v1),
     ],
     products: [
@@ -23,6 +24,9 @@ let package = Package(
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "TSPlayerKit",
+            resources: [
+                .process("Resources")
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("Foundation"),

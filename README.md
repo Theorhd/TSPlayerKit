@@ -174,18 +174,37 @@ func downloadAndPlay(from remoteURL: URL) async throws {
 Point d'entrée principal. Wrapper qui produit un `AVPlayerItem` configuré pour la lecture d'un fichier `.ts`.
 
 ```swift
-public struct TSPlayerItem {
+public final class TSPlayerItem {
     /// L'AVPlayerItem prêt à être lu par AVPlayer.
     public let playerItem: AVPlayerItem
 
     /// Crée un player item pour un fichier .ts local.
     /// - Parameters:
     ///   - tsFileURL: L'URL locale du fichier .ts
-    ///   - targetDuration: Durée déclarée dans le manifeste HLS (secondes, défaut: 10)
-    /// - Throws: FileStreamerError si le fichier est inaccessible
-    public init(tsFileURL: URL, targetDuration: Double = 10.0) throws
+    ///   - totalDuration: Durée totale déclarée dans le manifeste HLS (secondes)
+    /// - Throws: TSPlayerItemError si les segments sont invalides
+    public init(tsFileURL: URL, totalDuration: Double) throws
+
+    /// Mode multi-segments (concatenated TS) : tous les segments dans un seul fichier.
+    public init(tsFileURL: URL, segments: [SegmentInfo]) throws
+
+    /// Mode multi-fichiers : les segments répartis dans plusieurs fichiers .ts
+    /// (champ `file` de `SegmentInfo`).
+    public init(tsFilesDirectory: URL, segments: [SegmentInfo]) throws
+
+    /// Mode fMP4 : sert un répertoire de fichiers (`index.m3u8` + segments/init).
+    public init(fmp4Directory: URL) throws
 }
 ```
+
+### `TSPlayerItemError`
+
+Erreurs lancées par les initialiseurs de `TSPlayerItem` (public depuis 1.2.0).
+
+| Cas | Description |
+|---|---|
+| `.emptySegments` | Le tableau `segments` est vide |
+| `.missingFileField` | Un segment multi-fichiers a un champ `file` à `nil` |
 
 ### `FileStreamerError`
 
@@ -208,6 +227,8 @@ Sources/TSPlayerKit/
 ├── AdStrippingProxy.swift          ← Proxy HLS anti-pub (v1.1.0)
 ├── HLSPlaylistCleaner.swift        ← Détection de pubs + rewriting de playlist
 ├── RemotePlaylistFetcher.swift     ← Fetch HTTP distant (playlists + segments)
+├── SlateSegment.swift              ← Segment placeholder embarqué (live)
+├── Resources/slate.ts              ← Slate MPEG-TS (2 s, noir + silence)
 ├── LocalHTTPServer.swift           ← Serveur HTTP local (NWListener)
 ├── HLSManifestGenerator.swift      ← Génération du .m3u8 virtuel
 └── FileStreamer.swift              ← Lecture disque asynchrone (FileHandle)
@@ -219,6 +240,7 @@ Sources/TSPlayerKit/
 | `AdStrippingProxy` | Proxy HTTP local qui nettoie les pubs d'un flux HLS distant |
 | `HLSPlaylistCleaner` | Détection des segments publicitaires (CUE, patterns URL, durées) et réécriture des playlists |
 | `RemotePlaylistFetcher` | Fetch HTTP de playlists et segments depuis un CDN distant (via URLSession) |
+| `SlateSegment` | Charge le segment placeholder embarqué servi à la place des pubs en live |
 | `LocalHTTPServer` | Serveur HTTP local basé sur `NWListener` : sert le manifest et les segments TS via HTTP standard |
 | `HLSManifestGenerator` | Génère la chaîne `.m3u8` avec les URLs `http://127.0.0.1:[port]/...` |
 | `FileStreamer` | Lecture thread-safe du fichier via `FileHandle`, avec support byte-range pour le seek |
@@ -229,9 +251,9 @@ Sources/TSPlayerKit/
 
 | Plateforme | Version minimum |
 |---|---|
-| macOS | 10.15+ |
-| iOS | 13.0+ (compatible iOS 17+) |
-| tvOS | 13.0+ |
+| macOS | 12.0+ |
+| iOS | 15.0+ (compatible iOS 17+) |
+| tvOS | 15.0+ |
 | visionOS | 1.0+ |
 | Swift | 6.3+ |
 | Frameworks | `AVFoundation`, `Foundation`, `Network` |
@@ -262,6 +284,13 @@ player.play()
 
 **Fonctionnement** : le proxy expose `http://127.0.0.1:{port}/master.m3u8`. AVPlayer lit depuis cette URL locale. Le proxy fetch le flux original, détecte et retire les pubs (tags SCTE35/CUE, patterns d'URL, heuristiques de durée), puis sert un playlist nettoyé.
 
+**Traitement des pubs selon le type de flux** :
+- **VOD** — les segments pubs sont *supprimés* de la playlist (le break est sauté).
+- **Live (TS)** — les segments pubs sont *remplacés* par un segment placeholder local (« slate » : 2 s d'écran noir + silence, MPEG-TS embarqué en ressource). Pendant une pause publicitaire, la fenêtre glissante Twitch peut être 100 % pubs : tout supprimer produisait une playlist vide qu'AVPlayer abandonnait après 1,5 × TARGETDURATION (`CoreMediaErrorDomain -12888`). Avec le slate, la playlist avance normalement et la lecture survit à la pause.
+- **Live fMP4** (`#EXT-X-MAP`) ou ressource slate indisponible — repli sur la suppression (comportement antérieur).
+
+Le slate est servi localement sur `/slate/{index}.ts` (aucun aller-retour réseau) : l'index est l'index global du segment (URL **stable** d'un poll à l'autre — AVPlayer stoppe si l'URL d'un segment live change — et base du décalage de timestamps). Chaque copie est réécrite à la volée : layout PES standardisé et PTS décalé sur la timeline du contenu (`index × durée`), si bien que le run de slate est **continu en timestamps et ne nécessite aucun `EXT-X-DISCONTINUITY`** (un discontinuity à la live edge fait stall AVPlayer, `CoreMediaErrorDomain -12312`). Si le flux est chiffré (`#EXT-X-KEY`), le cleaner ferme la portée de la clé (`METHOD=NONE`) pendant le slate et la ré-ouvre à la reprise du contenu.
+
 **Modes de segments** :
 - `.stream` (défaut) — le proxy fetch et relaye les bytes des segments
 - `.redirect` — HTTP 302 vers le CDN original (moins de bandwidth, mais AVPlayer peut mal le gérer)
@@ -270,7 +299,6 @@ player.play()
 
 ## Limitations
 
-- **Un seul segment** — La playlist ne déclare qu'un seul segment TS. Pour des vidéos multi-segments, le manifeste devrait être enrichi.
 - **Pas de chiffrement** — Les fichiers doivent être en clair (pas de FairPlay DRM).
 - **Performances disque** — `FileHandle` lit de manière synchrone sur une queue dédiée. Pour des fichiers très volumineux (>10 Go), le seek peut introduire une latence perceptible.
 - **Codecs supportés** — Dépend des capacités d'`AVFoundation` sur l'appareil. Les codecs non supportés par la plateforme ne seront pas lus.
